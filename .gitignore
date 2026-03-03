@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+my_project_env/
+
+# Secrets — NEVER commit
+.env
+
+# Dagster runtime
+.tmp_dagster_home_*/
+dagster-home/
+
+# SQLite (Dagster local dev DB)
+*.db
+*.db-wal
+*.db-shm
+
+# Spark event logs (large, local only)
+spark-events/
+
+# OS
+.DS_Store
+Thumbs.db
