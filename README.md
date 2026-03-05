@@ -1,16 +1,10 @@
-# CryptoPrice — Real-time Crypto Streaming Platform
-
-Streaming giá crypto real-time từ Binance WebSocket, xử lý bằng Flink + Spark, lưu trên MinIO (Iceberg), query bằng Trino, orchestrate bằng Dagster.
+Dự án streaming giá crypto real-time từ Binance WebSocket, xử lý bằng Flink + Spark,chia thành 2 luồng streaming và batch, luồng streaming từ Flink đổ dữ liệu vào KeyDB và InfluxDB để phục vụ dữ liệu realtime, luồng batch lấy dữ liệu từ Spark và lưu trên MinIO (Iceberg), query bằng Trino, orchestrate bằng Dagster.
 
 ---
 
 ## Kiến trúc
 
-```
-Binance WS ──► Producer ──► Kafka ──┬── Flink ──► KeyDB (cache) + InfluxDB (time-series)
-                                    └── Spark ──► MinIO/Iceberg (lakehouse) ──► Trino (SQL)
-                                                  Dagster (schedule batch jobs)
-```
+=![alt text](image.png) 
 
 ## Yêu cầu
 
