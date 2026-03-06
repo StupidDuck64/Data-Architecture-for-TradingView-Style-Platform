@@ -55,6 +55,7 @@ docker exec spark-master /opt/spark/bin/spark-submit --master spark://spark-mast
 | `ingest_crypto.py`             | Spark  | Submit thủ công              | Kafka            | MinIO/Iceberg                 |
 | `ingest_historical_iceberg.py` | Spark  | Dagster schedule (2:00 AM)   | Binance REST API | MinIO/Iceberg                 |
 | `iceberg_maintenance.py`       | Spark  | Dagster schedule (CN 3:00 AM)| Iceberg tables   | Compact + expire snapshots    |
+| `backfill_influx.py`           | Python | Auto on startup (one-shot)   | Binance REST API | InfluxDB (fill gap khi tắt máy) |
 
 ## Phân bổ tài nguyên
 

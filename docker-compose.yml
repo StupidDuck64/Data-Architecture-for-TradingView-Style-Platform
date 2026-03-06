@@ -355,6 +355,27 @@ services:
 # PRODUCER (long-running stream)
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# INFLUXDB BACKFILL (one-shot on startup – fills gap caused by machine downtime)
+# ══════════════════════════════════════════════════════════════════════════════
+
+  influx-backfill:
+    build:
+      context: .
+      dockerfile: docker/backfill/Dockerfile
+    container_name: influx-backfill
+    restart: "no"
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: vi
+      INFLUX_BUCKET: crypto
+    networks:
+      - crypto-net
+    depends_on:
+      influxdb:
+        condition: service_healthy
+
   producer:
     build:
       context: ./docker/producer

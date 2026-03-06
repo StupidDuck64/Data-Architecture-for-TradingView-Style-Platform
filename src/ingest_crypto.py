@@ -19,9 +19,11 @@ MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 
 CHECKPOINT_TICKER = "s3a://cryptoprice/checkpoints/crypto_ticker_v1"
 CHECKPOINT_TRADES = "s3a://cryptoprice/checkpoints/crypto_trades_v1"
+CHECKPOINT_KLINES = "s3a://cryptoprice/checkpoints/crypto_klines_v1"
 
 ICEBERG_TICKER = "iceberg_catalog.crypto_lakehouse.coin_ticker"
 ICEBERG_TRADES = "iceberg_catalog.crypto_lakehouse.coin_trades"
+ICEBERG_KLINES = "iceberg_catalog.crypto_lakehouse.coin_klines"
 
 spark = (
     SparkSession.builder.appName("BinanceDualStreamToIceberg")
@@ -86,6 +88,22 @@ trades_schema = StructType([
     StructField("is_buyer_maker", BooleanType(), True),
 ])
 
+klines_schema = StructType([
+    StructField("event_time",   LongType(),    True),
+    StructField("symbol",       StringType(),  True),
+    StructField("kline_start",  LongType(),    True),
+    StructField("kline_close",  LongType(),    True),
+    StructField("interval",     StringType(),  True),
+    StructField("open",         DoubleType(),  True),
+    StructField("high",         DoubleType(),  True),
+    StructField("low",          DoubleType(),  True),
+    StructField("close",        DoubleType(),  True),
+    StructField("volume",       DoubleType(),  True),
+    StructField("quote_volume", DoubleType(),  True),
+    StructField("trade_count",  LongType(),    True),
+    StructField("is_closed",    BooleanType(), True),
+])
+
 
 def read_kafka(topic: str):
     return (
@@ -142,6 +160,28 @@ spark.sql("""
     PARTITIONED BY (days(trade_timestamp))
 """)
 
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS iceberg_catalog.crypto_lakehouse.coin_klines (
+        event_time      BIGINT,
+        symbol          STRING,
+        kline_start     BIGINT,
+        kline_close     BIGINT,
+        interval        STRING,
+        open            DOUBLE,
+        high            DOUBLE,
+        low             DOUBLE,
+        close           DOUBLE,
+        volume          DOUBLE,
+        quote_volume    DOUBLE,
+        trade_count     BIGINT,
+        is_closed       BOOLEAN,
+        kline_timestamp TIMESTAMP,
+        ingested_at     TIMESTAMP
+    )
+    USING iceberg
+    PARTITIONED BY (days(kline_timestamp))
+""")
+
 
 ticker_df = (
     read_kafka("crypto_ticker")
@@ -188,6 +228,26 @@ query_trades = (
     .trigger(processingTime="1 minute")
     .option("checkpointLocation", CHECKPOINT_TRADES)
     .toTable(ICEBERG_TRADES)
+)
+
+klines_df = (
+    read_kafka("crypto_klines")
+    .select(from_json(col("value"), klines_schema).alias("d"))
+    .select("d.*")
+    .filter(col("kline_start").isNotNull())
+    .withColumn("kline_timestamp", (col("kline_start") / 1000).cast("timestamp"))
+    .withColumn("ingested_at", current_timestamp())
+    .withWatermark("kline_timestamp", "2 minutes")
+    .dropDuplicates(["symbol", "kline_start", "interval"])
+)
+
+query_klines = (
+    klines_df.writeStream
+    .format("iceberg")
+    .outputMode("append")
+    .trigger(processingTime="1 minute")
+    .option("checkpointLocation", CHECKPOINT_KLINES)
+    .toTable(ICEBERG_KLINES)
 )
 
 spark.streams.awaitAnyTermination()

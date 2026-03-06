@@ -79,15 +79,31 @@ def _run_spark_job(context: AssetExecutionContext, script_name: str, extra_args:
     description=(
         "Pulls 1h OHLCV klines from Binance API for all USDT pairs, "
         "fetches only rows newer than the last run, then writes to Iceberg "
-        "table local.crypto.historical_hourly on MinIO."
+        "table. Also detects & fills InfluxDB gaps from machine downtime."
     ),
     group_name="ingestion",
 )
-def iceberg_historical_klines(context: AssetExecutionContext) -> None:
+def backfill_historical(context: AssetExecutionContext) -> None:
     _run_spark_job(
         context,
-        script_name="ingest_historical_iceberg.py",
-        extra_args=["--mode", "incremental"],
+        script_name="backfill_historical.py",
+        extra_args=["--mode", "all", "--iceberg-mode", "incremental"],
+    )
+
+
+@asset(
+    description=(
+        "Aggregates 1-minute candles into hourly candles to reduce data bloat. "
+        "Runs on both InfluxDB (candles measurement) and Iceberg (coin_klines table). "
+        "Deletes 1m data older than RETENTION_1M_DAYS (default: 7 days)."
+    ),
+    group_name="maintenance",
+)
+def aggregate_candles(context: AssetExecutionContext) -> None:
+    _run_spark_job(
+        context,
+        script_name="aggregate_candles.py",
+        extra_args=["--mode", "all"],
     )
 
 
@@ -109,10 +125,10 @@ def iceberg_table_maintenance(context: AssetExecutionContext) -> None:
 
 
 schedule_daily_klines = ScheduleDefinition(
-    name="daily_kline_update",
-    target=iceberg_historical_klines,
+    name="daily_backfill_historical",
+    target=backfill_historical,
     cron_schedule="0 2 * * *",
-    description="Runs daily at 02:00 AM to ingest latest klines into Iceberg.",
+    description="Runs daily at 02:00 AM to backfill InfluxDB gaps and ingest latest klines into Iceberg.",
 )
 
 schedule_weekly_maintenance = ScheduleDefinition(
@@ -122,13 +138,22 @@ schedule_weekly_maintenance = ScheduleDefinition(
     description="Runs every Sunday at 03:00 AM to compact and clean up Iceberg tables.",
 )
 
+schedule_daily_aggregate = ScheduleDefinition(
+    name="daily_candle_aggregation",
+    target=aggregate_candles,
+    cron_schedule="0 4 * * *",
+    description="Runs daily at 04:00 AM to aggregate 1m candles into 1h and clean up old 1m data.",
+)
+
 defs = Definitions(
     assets=[
-        iceberg_historical_klines,
+        backfill_historical,
+        aggregate_candles,
         iceberg_table_maintenance,
     ],
     schedules=[
         schedule_daily_klines,
         schedule_weekly_maintenance,
+        schedule_daily_aggregate,
     ],
 )

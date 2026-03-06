@@ -20,6 +20,8 @@ MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 TABLES = [
     "iceberg_catalog.crypto_lakehouse.coin_ticker",
     "iceberg_catalog.crypto_lakehouse.coin_trades",
+    "iceberg_catalog.crypto_lakehouse.coin_klines",
+    "iceberg_catalog.crypto_lakehouse.coin_klines_hourly",
 ]
 
 SNAPSHOT_RETENTION_HOURS = 48

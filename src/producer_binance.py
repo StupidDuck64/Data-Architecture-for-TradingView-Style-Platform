@@ -24,6 +24,12 @@ TICKER_HEARTBEAT_INTERVAL = 5.0
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
 KAFKA_TOPIC_TICKER = "crypto_ticker"
 KAFKA_TOPIC_TRADES = "crypto_trades"
+KAFKA_TOPIC_KLINES = "crypto_klines"
+KAFKA_TOPIC_DEPTH  = "crypto_depth"
+KLINE_INTERVAL_WS  = os.environ.get("KLINE_INTERVAL", "1m")
+DEPTH_LEVEL        = os.environ.get("DEPTH_LEVEL", "20")   # top 20 bids/asks
+DEPTH_UPDATE_MS    = os.environ.get("DEPTH_UPDATE_MS", "100")  # 100ms updates
+SYMBOLS_PER_DEPTH_CONN = 50  # fewer per connection — depth is heavier
 
 producer: KafkaProducer | None = None
 producer_lock = threading.Lock()
@@ -262,12 +268,174 @@ def run_agg_trade_batch(stream_url: str, batch_idx: int) -> None:
             time.sleep(delay)
 
 
+def map_kline(raw: Dict[str, Any]) -> Dict[str, Any]:
+    k = raw["k"]
+    return {
+        "event_time":   raw["E"],
+        "symbol":       raw["s"],
+        "kline_start":  k["t"],
+        "kline_close":  k["T"],
+        "interval":     k["i"],
+        "open":         float(k["o"]),
+        "high":         float(k["h"]),
+        "low":          float(k["l"]),
+        "close":        float(k["c"]),
+        "volume":       float(k["v"]),
+        "quote_volume": float(k["q"]),
+        "trade_count":  int(k["n"]),
+        "is_closed":    bool(k["x"]),
+    }
+
+
+def handle_kline_message(message: str) -> None:
+    try:
+        envelope: Any = json.loads(message)
+    except json.JSONDecodeError as e:
+        logging.error("[KLINES] JSON decode error: %s", e)
+        return
+
+    if not isinstance(envelope, dict):
+        return
+
+    payload = envelope.get("data", envelope)
+    if not isinstance(payload, dict) or payload.get("e") != "kline":
+        return
+
+    symbol = payload.get("s", "")
+    if not symbol.endswith("USDT"):
+        return
+
+    send_to_kafka(KAFKA_TOPIC_KLINES, map_kline(payload))
+    k = payload.get("k", {})
+    logging.debug(
+        "[KLINES] %s o=%.4f h=%.4f l=%.4f c=%.4f closed=%s",
+        symbol,
+        float(k.get("o", 0)), float(k.get("h", 0)),
+        float(k.get("l", 0)), float(k.get("c", 0)),
+        k.get("x", False),
+    )
+
+
+def run_kline_batch(stream_url: str, batch_idx: int) -> None:
+    url_preview = stream_url[:120] + "..." if len(stream_url) > 120 else stream_url
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                stream_url,
+                on_open=lambda ws: logging.info(
+                    "[KLINES] Batch #%d WebSocket opened.", batch_idx
+                ),
+                on_message=lambda ws, msg: handle_kline_message(msg),
+                on_error=lambda ws, err: logging.error(
+                    "[KLINES] Batch #%d error: %s", batch_idx, err
+                ),
+                on_close=lambda ws, code, msg: logging.warning(
+                    "[KLINES] Batch #%d closed. code=%s", batch_idx, code
+                ),
+            )
+            logging.info("[KLINES] Batch #%d connecting: %s", batch_idx, url_preview)
+            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            delay = 5 + random.random() * batch_idx
+            logging.warning(
+                "[KLINES] Batch #%d dropped. Reconnecting in %.1fs...", batch_idx, delay
+            )
+            time.sleep(delay)
+        except Exception as e:
+            delay = 5 + random.random() * batch_idx
+            logging.exception(
+                "[KLINES] Batch #%d unexpected error: %s. Retry in %.1fs...",
+                batch_idx, e, delay,
+            )
+            time.sleep(delay)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STREAM D: Order-book depth (@depth{LEVEL}@{UPDATE_MS}ms)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def map_depth(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Map Binance partial depth event to Kafka record."""
+    return {
+        "event_time":    raw.get("E", int(time.time() * 1000)),
+        "symbol":        raw.get("s", ""),
+        "last_update_id": raw.get("lastUpdateId", 0),
+        "bids":          [[float(p), float(q)] for p, q in raw.get("bids", [])],
+        "asks":          [[float(p), float(q)] for p, q in raw.get("asks", [])],
+    }
+
+
+def handle_depth_message(message: str) -> None:
+    try:
+        envelope: Any = json.loads(message)
+    except json.JSONDecodeError as e:
+        logging.error("[DEPTH] JSON decode error: %s", e)
+        return
+
+    if not isinstance(envelope, dict):
+        return
+
+    payload = envelope.get("data", envelope)
+    if not isinstance(payload, dict) or payload.get("e") != "depthUpdate":
+        # partial book depth uses different event type
+        # for @depth<levels>@<speed>, payload has 'lastUpdateId', 'bids', 'asks'
+        if "lastUpdateId" not in payload:
+            return
+
+    # For combined streams, symbol comes from the stream name
+    if "s" not in payload:
+        stream_name = envelope.get("stream", "")
+        # e.g. "btcusdt@depth20@100ms" → "BTCUSDT"
+        symbol = stream_name.split("@")[0].upper() if stream_name else ""
+        payload["s"] = symbol
+
+    symbol = payload.get("s", "")
+    if not symbol.endswith("USDT"):
+        return
+
+    send_to_kafka(KAFKA_TOPIC_DEPTH, map_depth(payload))
+
+
+def run_depth_batch(stream_url: str, batch_idx: int) -> None:
+    url_preview = stream_url[:120] + "..." if len(stream_url) > 120 else stream_url
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                stream_url,
+                on_open=lambda ws: logging.info(
+                    "[DEPTH] Batch #%d WebSocket opened.", batch_idx
+                ),
+                on_message=lambda ws, msg: handle_depth_message(msg),
+                on_error=lambda ws, err: logging.error(
+                    "[DEPTH] Batch #%d error: %s", batch_idx, err
+                ),
+                on_close=lambda ws, code, msg: logging.warning(
+                    "[DEPTH] Batch #%d closed. code=%s", batch_idx, code
+                ),
+            )
+            logging.info("[DEPTH] Batch #%d connecting: %s", batch_idx, url_preview)
+            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            delay = 5 + random.random() * batch_idx
+            logging.warning(
+                "[DEPTH] Batch #%d dropped. Reconnecting in %.1fs...", batch_idx, delay
+            )
+            time.sleep(delay)
+        except Exception as e:
+            delay = 5 + random.random() * batch_idx
+            logging.exception(
+                "[DEPTH] Batch #%d unexpected error: %s. Retry in %.1fs...",
+                batch_idx, e, delay,
+            )
+            time.sleep(delay)
+
+
 def run() -> None:
     setup_logging()
     logging.info("=" * 60)
-    logging.info("Binance Dual-Stream Producer starting...")
-    logging.info("  → Stream A: !ticker@arr    → topic: %s", KAFKA_TOPIC_TICKER)
-    logging.info("  → Stream B: @aggTrade      → topic: %s", KAFKA_TOPIC_TRADES)
+    logging.info("Binance Quad-Stream Producer starting...")
+    logging.info("  \u2192 Stream A: !ticker@arr                    \u2192 topic: %s", KAFKA_TOPIC_TICKER)
+    logging.info("  \u2192 Stream B: @aggTrade                      \u2192 topic: %s", KAFKA_TOPIC_TRADES)
+    logging.info("  \u2192 Stream C: @kline_%s                    \u2192 topic: %s", KLINE_INTERVAL_WS, KAFKA_TOPIC_KLINES)
+    logging.info("  \u2192 Stream D: @depth%s@%sms               \u2192 topic: %s", DEPTH_LEVEL, DEPTH_UPDATE_MS, KAFKA_TOPIC_DEPTH)
     logging.info("=" * 60)
 
     global producer
@@ -303,6 +471,47 @@ def run() -> None:
         t.start()
         trade_threads.append(t)
         time.sleep(1.0)
+
+    logging.info(
+        "Spawning %d kline thread(s) for %d symbols (interval=%s, %d/connection).",
+        len(batches), len(symbols), KLINE_INTERVAL_WS, SYMBOLS_PER_CONNECTION,
+    )
+    kline_threads: List[threading.Thread] = []
+    for idx, batch in enumerate(batches):
+        streams = "/".join(f"{s}@kline_{KLINE_INTERVAL_WS}" for s in batch)
+        url = f"{BINANCE_COMBINED_WS_BASE}?streams={streams}"
+        t = threading.Thread(
+            target=run_kline_batch,
+            args=(url, idx + 1),
+            daemon=True,
+            name=f"ws-klines-{idx + 1}",
+        )
+        t.start()
+        kline_threads.append(t)
+        time.sleep(1.0)
+
+    # ── Stream D: Order book depth ──────────────────────────────────────────
+    depth_batches = [
+        symbols[i : i + SYMBOLS_PER_DEPTH_CONN]
+        for i in range(0, len(symbols), SYMBOLS_PER_DEPTH_CONN)
+    ]
+    logging.info(
+        "Spawning %d depth thread(s) for %d symbols (@depth%s@%sms, %d/connection).",
+        len(depth_batches), len(symbols), DEPTH_LEVEL, DEPTH_UPDATE_MS, SYMBOLS_PER_DEPTH_CONN,
+    )
+    depth_threads: List[threading.Thread] = []
+    for idx, batch in enumerate(depth_batches):
+        streams = "/".join(f"{s}@depth{DEPTH_LEVEL}@{DEPTH_UPDATE_MS}ms" for s in batch)
+        url = f"{BINANCE_COMBINED_WS_BASE}?streams={streams}"
+        t = threading.Thread(
+            target=run_depth_batch,
+            args=(url, idx + 1),
+            daemon=True,
+            name=f"ws-depth-{idx + 1}",
+        )
+        t.start()
+        depth_threads.append(t)
+        time.sleep(0.5)
 
     try:
         while True:
