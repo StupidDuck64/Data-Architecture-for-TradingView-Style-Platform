@@ -29,7 +29,8 @@ KAFKA_TOPIC_DEPTH  = "crypto_depth"
 KLINE_INTERVAL_WS  = os.environ.get("KLINE_INTERVAL", "1m")
 DEPTH_LEVEL        = os.environ.get("DEPTH_LEVEL", "20")   # top 20 bids/asks
 DEPTH_UPDATE_MS    = os.environ.get("DEPTH_UPDATE_MS", "100")  # 100ms updates
-SYMBOLS_PER_DEPTH_CONN = 50  # fewer per connection — depth is heavier
+SYMBOLS_PER_DEPTH_CONN = 200  # same batch size as trades/klines
+MAX_SYMBOLS        = 400      # cap to avoid exceeding Binance WS connection limits
 
 producer: KafkaProducer | None = None
 producer_lock = threading.Lock()
@@ -448,7 +449,7 @@ def run() -> None:
     )
     ticker_thread.start()
 
-    symbols = fetch_usdt_symbols()
+    symbols = fetch_usdt_symbols()[:MAX_SYMBOLS]
     batches = [
         symbols[i : i + SYMBOLS_PER_CONNECTION]
         for i in range(0, len(symbols), SYMBOLS_PER_CONNECTION)
@@ -511,7 +512,7 @@ def run() -> None:
         )
         t.start()
         depth_threads.append(t)
-        time.sleep(0.5)
+        time.sleep(1.0)
 
     try:
         while True:
