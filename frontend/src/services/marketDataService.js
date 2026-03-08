@@ -345,6 +345,21 @@ export async function fetchTrades(symbol, limit = 50) {
 // ─── Tickers ──────────────────────────────────────────────────────
 
 /**
+ * Fetch a single live ticker by symbol.
+ * Returns { symbol, price, bid, ask, volume, event_time }
+ */
+export async function fetchTicker(symbol) {
+  if (DATA_SOURCE === "api") {
+    const res = await fetch(
+      `${API_BASE_URL}/ticker/${encodeURIComponent(symbol)}`,
+    );
+    if (!res.ok) throw new Error(`API error ${res.status}`);
+    return res.json();
+  }
+  return { symbol, price: 0 };
+}
+
+/**
  * Fetch all live tickers.
  * Backend returns [{ symbol, price, bid, ask, volume, event_time }]
  */

@@ -10,6 +10,8 @@ import { THEME, localTickMarkFormatter } from "./chartConstants";
 const OscillatorPane = ({ data, settings, label }) => {
   const ref = useRef(null);
   const chartRef = useRef(null);
+  const seriesRef = useRef(null);
+  const prevLenRef = useRef(0);
 
   useEffect(() => {
     if (!ref.current || !data || data.length === 0) return;
@@ -45,6 +47,7 @@ const OscillatorPane = ({ data, settings, label }) => {
       crosshairMarkerVisible: true,
     });
     series.setData(data);
+    prevLenRef.current = data.length;
 
     // Overbought / Oversold bands
     if (settings.overbought != null) {
@@ -68,6 +71,7 @@ const OscillatorPane = ({ data, settings, label }) => {
 
     chart.timeScale().fitContent();
     chartRef.current = chart;
+    seriesRef.current = series;
     const ro = new ResizeObserver(() => {
       if (ref.current)
         chart.resize(ref.current.clientWidth, ref.current.clientHeight);
@@ -77,16 +81,23 @@ const OscillatorPane = ({ data, settings, label }) => {
       ro.disconnect();
       chart.remove();
       chartRef.current = null;
+      seriesRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Update data
+  // Update data — use lightweight update() for tick changes, full setData for new candles
   useEffect(() => {
-    if (!chartRef.current || !data || data.length === 0) return;
-    // Re-create series on settings change is handled by unmount/remount via key
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, settings]);
+    if (!seriesRef.current || !data || data.length === 0) return;
+    if (data.length !== prevLenRef.current) {
+      // New candle appeared or full refresh — reset all data
+      seriesRef.current.setData(data);
+      prevLenRef.current = data.length;
+    } else {
+      // Same number of points — just update the last point (tick agitation)
+      seriesRef.current.update(data[data.length - 1]);
+    }
+  }, [data]);
 
   return (
     <div className="relative border-t border-gray-700" style={{ height: 100 }}>

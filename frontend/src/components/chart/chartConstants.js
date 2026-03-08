@@ -55,17 +55,8 @@ export function localTickMarkFormatter(time, tickMarkType, locale) {
   }
 }
 
-// Polling intervals (ms) for auto-refresh per timeframe
-export const REFRESH_INTERVALS = {
-  "1s": 2000,
-  "1m": 10000,
-  "5m": 30000,
-  "15m": 60000,
-  "1H": 60000,
-  "4H": 120000,
-  "1D": 300000,
-  "1W": 600000,
-};
+// Real-time polling interval (ms) — constant for all timeframes
+export const REALTIME_POLL_MS = 2000;
 
 export const CHART_TABS = [
   "candlestick",

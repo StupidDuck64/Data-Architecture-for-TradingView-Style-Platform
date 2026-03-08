@@ -11,6 +11,7 @@ import { Settings, Download } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
   fetchCandles,
+  fetchTicker,
   fetchHistoricalCandles,
 } from "../services/marketDataService";
 import MarketSelector from "./MarketSelector";
@@ -24,7 +25,6 @@ import {
   CHART_TABS,
   TAB_ICONS,
   DEFAULT_INDICATOR_SETTINGS,
-  REFRESH_INTERVALS,
   localTickMarkFormatter,
 } from "./chart/chartConstants";
 import { calcSMA, calcEMA, calcRSI, calcMFI } from "./chart/indicatorUtils";
@@ -49,6 +49,7 @@ const CandlestickChart = ({
   const sma20Ref = useRef(null);
   const sma50Ref = useRef(null);
   const emaRef = useRef(null);
+  const candlesRef = useRef([]);
 
   const [symbol, setSymbol] = useState(symbolProp || defaultSymbol);
   const [timeframe, setTimeframe] = useState("1m");
@@ -203,6 +204,7 @@ const CandlestickChart = ({
     (data) => {
       if (!candleRef.current) return;
       setCandles(data);
+      candlesRef.current = data;
       setNoData(data.length === 0);
       candleRef.current.setData(data);
       const vs = volumeRef.current;
@@ -239,9 +241,10 @@ const CandlestickChart = ({
         .applyOptions({ secondsVisible: showSeconds });
     }
 
+    // Full load — fetches 200 candles, rebuilds all series + indicators
     const loadData = () => {
       setFetchError(null);
-      fetchCandles(symbol, timeframe.toLowerCase(), 120)
+      fetchCandles(symbol, timeframe.toLowerCase(), 200)
         .then((data) => {
           applyDataToChart(data);
           setIsLoading(false);
@@ -252,14 +255,50 @@ const CandlestickChart = ({
         });
     };
 
+    // Lightweight tick — fetches live ticker price and patches the last
+    // candle's close/high/low so it visually "agitates" in real time.
+    const tickUpdate = () => {
+      fetchTicker(symbol)
+        .then((ticker) => {
+          if (!ticker || !candleRef.current) return;
+          const prev = candlesRef.current;
+          if (prev.length === 0) return;
+          const price = ticker.price;
+          const last = { ...prev[prev.length - 1] };
+          last.close = price;
+          last.high = Math.max(last.high, price);
+          last.low = Math.min(last.low, price);
+          candleRef.current.update(last);
+          if (volumeRef.current) {
+            volumeRef.current.update({
+              time: last.time,
+              value: last.volume,
+              color: price >= last.open ? THEME.volumeUp : THEME.volumeDown,
+            });
+          }
+          const next = [...prev];
+          next[next.length - 1] = last;
+          candlesRef.current = next;
+          setCandles(next);
+          setTooltip((tip) =>
+            tip ? { ...tip, ...last, timeLabel: tip.timeLabel } : null,
+          );
+        })
+        .catch(() => {}); // silent — full refresh will recover
+    };
+
     setIsLoading(true);
     setNoData(false);
     loadData();
 
-    // Auto-refresh polling based on selected timeframe
-    const interval = REFRESH_INTERVALS[timeframe] || 60000;
-    const pollId = setInterval(loadData, interval);
-    return () => clearInterval(pollId);
+    // Full sync every 30 s (recalculates indicators)
+    const fullPollId = setInterval(loadData, 30000);
+    // Live tick every 1 s for candle agitation
+    const tickPollId = setInterval(tickUpdate, 1000);
+    return () => {
+      clearInterval(fullPollId);
+      clearInterval(tickPollId);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, timeframe, historicalRange, retryCount]);
 

@@ -146,4 +146,26 @@ async def get_klines(
     if base != interval and candles:
         candles = _aggregate(candles, target_sec * 1000)
 
+    # Merge the live in-progress candle from KeyDB so the latest bar
+    # reflects real-time price changes (agitation) between interval boundaries.
+    r = await get_redis()
+    live = await r.hgetall(f"candle:latest:{symbol}")
+    if live:
+        target_ms = target_sec * 1000
+        kline_start = int(live["kline_start"])
+        aligned_time = (kline_start // target_ms) * target_ms
+        live_candle = {
+            "openTime": aligned_time,
+            "open": float(live["open"]),
+            "high": float(live["high"]),
+            "low": float(live["low"]),
+            "close": float(live["close"]),
+            "volume": float(live["volume"]),
+        }
+        if candles and candles[-1]["openTime"] == aligned_time:
+            # Same period — replace with the live version (has latest OHLCV)
+            candles[-1] = live_candle
+        elif not candles or aligned_time > candles[-1]["openTime"]:
+            candles.append(live_candle)
+
     return candles[-limit:]

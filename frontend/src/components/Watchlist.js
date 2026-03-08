@@ -1,6 +1,8 @@
-import React from "react";
-import { Star } from "lucide-react";
+import React, { useState } from "react";
+import { Star, ChevronLeft, ChevronRight } from "lucide-react";
 import { useI18n } from "../i18n";
+
+const PAGE_SIZE = 10;
 
 const Watchlist = ({
   items,
@@ -12,13 +14,19 @@ const Watchlist = ({
   onToggleStar,
 }) => {
   const { t } = useI18n();
+  const [page, setPage] = useState(0);
 
-  const MAX_VISIBLE = 10;
   const allFiltered =
     filter === "starred"
       ? items.filter((item) => starredSymbols.includes(item.symbol))
       : items;
-  const filteredItems = allFiltered.slice(0, MAX_VISIBLE);
+  const totalPages = Math.max(1, Math.ceil(allFiltered.length / PAGE_SIZE));
+  // Reset page if it overflows after filter change
+  const safePage = Math.min(page, totalPages - 1);
+  const filteredItems = allFiltered.slice(
+    safePage * PAGE_SIZE,
+    (safePage + 1) * PAGE_SIZE,
+  );
 
   return (
     <aside className="w-64 bg-gray-800 p-4 rounded-lg overflow-y-auto">
@@ -97,10 +105,26 @@ const Watchlist = ({
           </li>
         )}
       </ul>
-      {allFiltered.length > MAX_VISIBLE && (
-        <p className="text-center text-gray-500 text-xs mt-2">
-          Showing {MAX_VISIBLE} of {allFiltered.length} symbols
-        </p>
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between mt-2">
+          <button
+            onClick={() => setPage((p) => Math.max(0, p - 1))}
+            disabled={safePage === 0}
+            className="p-1 rounded text-gray-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            <ChevronLeft size={16} />
+          </button>
+          <span className="text-xs text-gray-500">
+            {safePage + 1} / {totalPages}
+          </span>
+          <button
+            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+            disabled={safePage >= totalPages - 1}
+            className="p-1 rounded text-gray-400 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            <ChevronRight size={16} />
+          </button>
+        </div>
       )}
     </aside>
   );
