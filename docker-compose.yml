@@ -23,10 +23,9 @@ volumes:
   dagster-home:
 
 services:
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA LAYER
-# ══════════════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════════════════
+  # DATA LAYER
+  # ══════════════════════════════════════════════════════════════════════════════
 
   kafka:
     image: apache/kafka:3.9.0
@@ -55,7 +54,11 @@ services:
     networks:
       - crypto-net
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1",
+        ]
       interval: 15s
       timeout: 10s
       retries: 10
@@ -161,9 +164,9 @@ services:
       timeout: 3s
       retries: 5
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COMPUTE LAYER
-# ══════════════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════════════════
+  # COMPUTE LAYER
+  # ══════════════════════════════════════════════════════════════════════════════
 
   flink-jobmanager:
     build:
@@ -172,7 +175,7 @@ services:
     container_name: flink-jobmanager
     hostname: flink-jobmanager
     ports:
-      - "8081:8081"   # Flink Web UI
+      - "8081:8081" # Flink Web UI
     command: jobmanager
     environment:
       JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
@@ -233,7 +236,7 @@ services:
     hostname: spark-master
     ports:
       - "7077:7077"
-      - "8082:8080"   # Spark Master UI
+      - "8082:8080" # Spark Master UI
       - "18080:18080" # Spark History Server
     environment:
       SPARK_MODE: master
@@ -272,16 +275,16 @@ services:
     depends_on:
       - spark-master
 
-# ══════════════════════════════════════════════════════════════════════════════
-# QUERY + ORCHESTRATION LAYER
-# ══════════════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════════════════
+  # QUERY + ORCHESTRATION LAYER
+  # ══════════════════════════════════════════════════════════════════════════════
 
   trino:
     image: trinodb/trino:442
     container_name: trino
     hostname: trino
     ports:
-      - "8083:8080"   # Trino UI (avoid conflict with spark UI on 8082)
+      - "8083:8080" # Trino UI (avoid conflict with spark UI on 8082)
     volumes:
       - ./docker/trino/etc:/etc/trino:ro
       - trino-data:/data/trino
@@ -351,13 +354,54 @@ services:
     depends_on:
       - dagster-webserver
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PRODUCER (long-running stream)
-# ══════════════════════════════════════════════════════════════════════════════
+  # ══════════════════════════════════════════════════════════════════════════════
+  # SERVING LAYER (FastAPI)
+  # ══════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-# INFLUXDB BACKFILL (one-shot on startup – fills gap caused by machine downtime)
-# ══════════════════════════════════════════════════════════════════════════════
+  fastapi:
+    build:
+      context: .
+      dockerfile: docker/fastapi/Dockerfile
+    container_name: fastapi
+    hostname: fastapi
+    ports:
+      - "8080:8000"
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: keydb
+      REDIS_PORT: 6379
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: vi
+      INFLUX_BUCKET: crypto
+      CORS_ORIGINS: "*"
+    networks:
+      - crypto-net
+    depends_on:
+      keydb:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # PRODUCER (long-running stream)
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # INFLUXDB BACKFILL (one-shot on startup – fills gap caused by machine downtime)
+  # ══════════════════════════════════════════════════════════════════════════════
 
   influx-backfill:
     build:
