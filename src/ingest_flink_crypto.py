@@ -25,6 +25,11 @@ INFLUX_TOKEN  = os.environ.get("INFLUX_TOKEN",  "")
 INFLUX_ORG    = os.environ.get("INFLUX_ORG",    "vi")
 INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "crypto")
 
+SCHEMA_REGISTRY_URL = os.environ.get(
+    "SCHEMA_REGISTRY_URL",
+    "http://schema-registry:8080/apis/ccompat/v7",
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -141,10 +146,14 @@ class KeyDBKlineWriter(FlatMapFunction):
     - candle:1s:{symbol} → TTL 2 hours (for 1-second candles)
     - candle:1m:{symbol} → TTL 7 days (for 1-minute candles)
     - candle:latest:{symbol} → latest candle info (no TTL)
+
+    ZREMRANGEBYSCORE runs every CLEANUP_EVERY writes per symbol instead of
+    every single write (batch cleanup optimisation — Phase 3).
     """
 
     TTL_1S = 7_200        # 2 hours for 1-second candles
     TTL_1M = 604_800      # 7 days for 1-minute candles
+    CLEANUP_EVERY = 60    # run ZREMRANGEBYSCORE once every 60 writes / symbol
 
     def open(self, runtime_context):
         self._r = redis.Redis(
@@ -152,6 +161,7 @@ class KeyDBKlineWriter(FlatMapFunction):
             decode_responses=True,
             socket_keepalive=True,
         )
+        self._write_count: dict[str, int] = {}  # per-symbol counter
 
     def close(self):
         try:
@@ -189,8 +199,6 @@ class KeyDBKlineWriter(FlatMapFunction):
                 history_key = f"candle:1m:{symbol}"
                 ttl_sec = self.TTL_1M
             
-            cutoff = kline_start - (ttl_sec * 1000)
-            
             pipe = self._r.pipeline()
             
             # Update latest candle (no TTL)
@@ -210,11 +218,13 @@ class KeyDBKlineWriter(FlatMapFunction):
             # Add to interval-specific sorted set
             pipe.zadd(history_key, {candle_json: kline_start})
             
-            # Remove old data beyond TTL
-            pipe.zremrangebyscore(history_key, 0, cutoff)
-            
-            # Set TTL on the sorted set key to auto-cleanup
-            pipe.expire(history_key, ttl_sec)
+            # Batch cleanup: only ZREMRANGEBYSCORE every N writes per symbol
+            count = self._write_count.get(symbol, 0) + 1
+            self._write_count[symbol] = count
+            if count % self.CLEANUP_EVERY == 0:
+                cutoff = kline_start - (ttl_sec * 1000)
+                pipe.zremrangebyscore(history_key, 0, cutoff)
+                pipe.expire(history_key, ttl_sec)
             
             pipe.execute()
         except Exception as e:
@@ -283,6 +293,160 @@ class InfluxDBKlineWriter(FlatMapFunction):
             s = value.get("symbol") if isinstance(value, dict) else "unknown"
             log.error("[InfluxDB/candles] flat_map error | symbol=%s error=%s", s, e)
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# In-flight 1s → 1m Window Aggregation  (dedup + gap-fill)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from pyflink.datastream.functions import KeyedProcessFunction
+from pyflink.datastream.state import MapStateDescriptor, ValueStateDescriptor
+
+
+class KlineWindowAggregator(KeyedProcessFunction):
+    """Aggregate 1s klines → 1m klines inside Flink state.
+
+    Strategy
+    --------
+    1. Each 1s candle is stored in ``MapState<kline_start_ms, json>``
+       (same key overwrites → **dedup**).
+    2. When a candle from a *new* minute arrives the previous window
+       is aggregated and emitted immediately.
+    3. A processing-time **safety timer** fires 65 s after the window
+       opens so the last window is never stuck (handles silence).
+    4. Missing seconds are **forward-filled** from the previous
+       candle's close price before aggregation.
+    """
+
+    WINDOW_MS = 60_000  # 1 minute
+
+    def open(self, runtime_context):
+        self._candles = runtime_context.get_map_state(
+            MapStateDescriptor("candles_1s", Types.LONG(), Types.STRING())
+        )
+        self._window_start = runtime_context.get_state(
+            ValueStateDescriptor("window_start", Types.LONG())
+        )
+        self._last_close = runtime_context.get_state(
+            ValueStateDescriptor("last_close", Types.DOUBLE())
+        )
+        self._symbol = runtime_context.get_state(
+            ValueStateDescriptor("symbol", Types.STRING())
+        )
+
+    # ── process each 1s candle ────────────────────────────────────────────
+
+    def process_element(self, value, ctx: 'KeyedProcessFunction.Context'):
+        candle = json.loads(value) if isinstance(value, str) else value
+        interval = candle.get("interval", "1s")
+        if interval != "1s":
+            return
+
+        kline_start = int(candle["kline_start"])
+        minute_start = (kline_start // self.WINDOW_MS) * self.WINDOW_MS
+
+        # remember symbol for on_timer
+        if self._symbol.value() is None:
+            self._symbol.update(candle["symbol"])
+
+        # upsert into state (dedup)
+        self._candles.put(kline_start, json.dumps({
+            "t":  kline_start,
+            "o":  float(candle["open"]),
+            "h":  float(candle["high"]),
+            "l":  float(candle["low"]),
+            "c":  float(candle["close"]),
+            "v":  float(candle["volume"]),
+            "qv": float(candle["quote_volume"]),
+            "n":  int(candle["trade_count"]),
+        }))
+        self._last_close.update(float(candle["close"]))
+
+        current_window = self._window_start.value()
+
+        if current_window is None:
+            # first candle ever for this key
+            self._window_start.update(minute_start)
+            self._register_safety_timer(ctx)
+
+        elif minute_start > current_window:
+            # new minute → aggregate & emit previous window
+            result = self._aggregate(current_window)
+            if result:
+                yield result
+
+            # start new window & safety timer
+            self._window_start.update(minute_start)
+            self._register_safety_timer(ctx)
+
+    # ── safety timer ──────────────────────────────────────────────────────
+
+    def on_timer(self, timestamp: int, ctx: 'KeyedProcessFunction.OnTimerContext'):
+        current_window = self._window_start.value()
+        if current_window is not None:
+            result = self._aggregate(current_window)
+            if result:
+                yield result
+            self._window_start.clear()
+
+    def _register_safety_timer(self, ctx):
+        fire_at = ctx.timer_service().current_processing_time() + 65_000
+        ctx.timer_service().register_processing_time_timer(fire_at)
+
+    # ── aggregation with gap-fill ─────────────────────────────────────────
+
+    def _aggregate(self, window_start: int) -> str | None:
+        # collect candles belonging to this window
+        window_candles: dict[int, dict] = {}
+
+        for ts, cjson in self._candles.items():
+            minute = (ts // self.WINDOW_MS) * self.WINDOW_MS
+            if minute == window_start:
+                window_candles[ts] = json.loads(cjson)
+
+        if not window_candles:
+            return None
+
+        # gap-fill missing seconds (forward-fill from previous close)
+        last_c = self._last_close.value() or next(iter(window_candles.values()))["c"]
+        for sec_offset in range(60):
+            ts = window_start + sec_offset * 1000
+            if ts in window_candles:
+                last_c = window_candles[ts]["c"]
+            else:
+                window_candles[ts] = {
+                    "t": ts, "o": last_c, "h": last_c,
+                    "l": last_c, "c": last_c,
+                    "v": 0.0, "qv": 0.0, "n": 0,
+                }
+
+        sorted_candles = [window_candles[k] for k in sorted(window_candles)]
+
+        symbol = self._symbol.value() or "unknown"
+        agg = {
+            "event_time":   int(time.time() * 1000),
+            "symbol":       symbol,
+            "kline_start":  window_start,
+            "kline_close":  window_start + 59_999,
+            "interval":     "1m",
+            "open":         sorted_candles[0]["o"],
+            "high":         max(c["h"] for c in sorted_candles),
+            "low":          min(c["l"] for c in sorted_candles),
+            "close":        sorted_candles[-1]["c"],
+            "volume":       sum(c["v"] for c in sorted_candles),
+            "quote_volume": sum(c["qv"] for c in sorted_candles),
+            "trade_count":  sum(c["n"] for c in sorted_candles),
+            "is_closed":    True,
+        }
+
+        # remove only aggregated keys (keep future-window candles intact)
+        for ts in window_candles:
+            self._candles.remove(ts)
+
+        real_count = sum(1 for c in sorted_candles if c["v"] > 0)
+        log.info("[Window] %s 1s→1m window %d  real=%d/60",
+                 symbol, window_start, real_count)
+        return json.dumps(agg)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -517,19 +681,18 @@ def run():
             `close`                DOUBLE,
             bid                    DOUBLE,
             ask                    DOUBLE,
-            `24h_volume`           DOUBLE,
-            `24h_quote_volume`     DOUBLE,
-            `24h_price_change_pct` DOUBLE,
-            `24h_trade_count`      BIGINT
+            h24_volume             DOUBLE,
+            h24_quote_volume       DOUBLE,
+            h24_price_change_pct   DOUBLE,
+            h24_trade_count        BIGINT
         ) WITH (
             'connector'                    = 'kafka',
             'topic'                        = 'crypto_ticker',
             'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
             'properties.group.id'          = 'flink_crypto_ticker_v1',
             'scan.startup.mode'            = 'latest-offset',
-            'format'                       = 'json',
-            'json.ignore-parse-errors'     = 'true',
-            'json.fail-on-missing-field'   = 'false'
+            'format'                       = 'avro-confluent',
+            'avro-confluent.url'           = '{SCHEMA_REGISTRY_URL}'
         )
     """)
 
@@ -540,10 +703,10 @@ def run():
             `close`,
             bid,
             ask,
-            `24h_volume`           AS h24_volume,
-            `24h_quote_volume`     AS h24_quote_volume,
-            `24h_price_change_pct` AS h24_price_change_pct,
-            `24h_trade_count`      AS h24_trade_count
+            h24_volume,
+            h24_quote_volume,
+            h24_price_change_pct,
+            h24_trade_count
         FROM kafka_ticker
     """)
     ds_row = t_env.to_data_stream(table)
@@ -587,9 +750,8 @@ def run():
             'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
             'properties.group.id'          = 'flink_crypto_klines_v1',
             'scan.startup.mode'            = 'latest-offset',
-            'format'                       = 'json',
-            'json.ignore-parse-errors'     = 'true',
-            'json.fail-on-missing-field'   = 'false'
+            'format'                       = 'avro-confluent',
+            'avro-confluent.url'           = '{SCHEMA_REGISTRY_URL}'
         )
     """)
 
@@ -630,15 +792,30 @@ def run():
         })
 
     ds_kline_dict = ds_kline_row.map(kline_row_to_dict, output_type=Types.STRING())
+
+    # ── Branch 1: write raw 1s candles to KeyDB + InfluxDB ─────────────────
     ds_kline_dict.flat_map(
         KeyDBKlineWriter(), output_type=Types.STRING()
-    ).name("Write_Klines_To_KeyDB").print()
+    ).name("Write_1s_Klines_To_KeyDB").print()
     ds_kline_dict.flat_map(
         InfluxDBKlineWriter(), output_type=Types.STRING()
-    ).name("Write_Klines_To_InfluxDB").print()
+    ).name("Write_1s_Klines_To_InfluxDB").print()
 
-    # ── Indicators pipeline: closed klines → SMA/EMA → KeyDB + InfluxDB ───────
-    ds_kline_dict.flat_map(
+    # ── Branch 2: in-flight 1s→1m aggregation (dedup + gap-fill) ──────────
+    ds_1m_candles = (
+        ds_kline_dict
+        .key_by(lambda v: json.loads(v)["symbol"])
+        .process(KlineWindowAggregator(), output_type=Types.STRING())
+    )
+    ds_1m_candles.flat_map(
+        KeyDBKlineWriter(), output_type=Types.STRING()
+    ).name("Write_1m_Klines_To_KeyDB").print()
+    ds_1m_candles.flat_map(
+        InfluxDBKlineWriter(), output_type=Types.STRING()
+    ).name("Write_1m_Klines_To_InfluxDB").print()
+
+    # ── Indicators pipeline: closed 1m klines → SMA/EMA → KeyDB + InfluxDB
+    ds_1m_candles.flat_map(
         IndicatorWriter(), output_type=Types.STRING()
     ).name("Write_Indicators").print()
 
@@ -656,9 +833,8 @@ def run():
             'properties.bootstrap.servers' = '{KAFKA_BOOTSTRAP}',
             'properties.group.id'          = 'flink_crypto_depth_v1',
             'scan.startup.mode'            = 'latest-offset',
-            'format'                       = 'json',
-            'json.ignore-parse-errors'     = 'true',
-            'json.fail-on-missing-field'   = 'false'
+            'format'                       = 'avro-confluent',
+            'avro-confluent.url'           = '{SCHEMA_REGISTRY_URL}'
         )
     """)
 

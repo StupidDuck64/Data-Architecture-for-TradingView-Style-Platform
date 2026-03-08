@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir \
     kafka-python==2.0.2 \
     requests==2.32.* \
     websocket-client==1.8.* \
+    fastavro==1.9.* \
     lz4
 
 WORKDIR /app

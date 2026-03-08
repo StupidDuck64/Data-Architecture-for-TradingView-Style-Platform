@@ -1,0 +1,20 @@
+{
+  "type": "record",
+  "name": "Ticker",
+  "namespace": "com.cryptoprice",
+  "fields": [
+    {"name": "event_time",           "type": "long"},
+    {"name": "symbol",               "type": "string"},
+    {"name": "close",                "type": "double"},
+    {"name": "bid",                  "type": "double"},
+    {"name": "ask",                  "type": "double"},
+    {"name": "h24_open",             "type": "double"},
+    {"name": "h24_high",             "type": "double"},
+    {"name": "h24_low",              "type": "double"},
+    {"name": "h24_volume",           "type": "double"},
+    {"name": "h24_quote_volume",     "type": "double"},
+    {"name": "h24_price_change",     "type": "double"},
+    {"name": "h24_price_change_pct", "type": "double"},
+    {"name": "h24_trade_count",      "type": "long"}
+  ]
+}

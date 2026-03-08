@@ -3,12 +3,15 @@ import json
 import logging
 import random
 import signal
+import struct
 import threading
 import time
+from io import BytesIO
 from typing import Any, Dict, List
 
 import os
 
+import fastavro
 import requests
 import websocket
 from kafka import KafkaProducer
@@ -29,6 +32,9 @@ KAFKA_TOPIC_DEPTH  = "crypto_depth"
 KLINE_INTERVAL_WS  = os.environ.get("KLINE_INTERVAL", "1m")
 DEPTH_LEVEL        = os.environ.get("DEPTH_LEVEL", "20")   # top 20 bids/asks
 DEPTH_UPDATE_MS    = os.environ.get("DEPTH_UPDATE_MS", "100")  # 100ms updates
+SCHEMA_REGISTRY_URL = os.environ.get(
+    "SCHEMA_REGISTRY_URL", "http://schema-registry:8080/apis/ccompat/v7"
+)
 SYMBOLS_PER_DEPTH_CONN = 200  # same batch size as trades/klines
 MAX_SYMBOLS        = 400      # cap to avoid exceeding Binance WS connection limits
 
@@ -37,6 +43,70 @@ producer_lock = threading.Lock()
 
 _last_close: Dict[str, float] = {}
 _last_sent_ts: Dict[str, float] = {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Avro Serializer  (Confluent wire format + Schema Registry)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AvroSerializer:
+    """Serialize dicts → Confluent wire-format Avro bytes
+    (magic 0x00 + 4-byte schema ID + Avro binary).
+    Registers schemas with a Confluent-compatible Schema Registry.
+    """
+
+    MAGIC = b'\x00'
+
+    def __init__(self, registry_url: str):
+        self._url = registry_url.rstrip('/')
+        self._cache: Dict[str, tuple] = {}   # topic → (parsed_schema, schema_id)
+
+    # ── public ───────────────────────────────────────────────────────────────
+    def register(self, topic: str, schema_path: str) -> None:
+        with open(schema_path) as f:
+            schema_dict = json.load(f)
+        parsed = fastavro.parse_schema(schema_dict)
+        schema_id = self._register_with_retry(f"{topic}-value", schema_dict)
+        self._cache[topic] = (parsed, schema_id)
+        logging.info("[AVRO] Registered %s-value  schema_id=%d", topic, schema_id)
+
+    def serialize(self, topic: str, record: dict) -> bytes:
+        parsed, sid = self._cache[topic]
+        buf = BytesIO()
+        buf.write(self.MAGIC)
+        buf.write(struct.pack('>I', sid))
+        fastavro.schemaless_writer(buf, parsed, record)
+        return buf.getvalue()
+
+    # ── internal ─────────────────────────────────────────────────────────────
+    def _register_with_retry(self, subject: str, schema_dict: dict,
+                             retries: int = 30) -> int:
+        for attempt in range(retries):
+            try:
+                resp = requests.post(
+                    f"{self._url}/subjects/{subject}/versions",
+                    json={"schema": json.dumps(schema_dict)},
+                    headers={"Content-Type":
+                             "application/vnd.schemaregistry.v1+json"},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                return resp.json()["id"]
+            except Exception as e:
+                if attempt < retries - 1:
+                    logging.warning("[AVRO] %s register failed (%s), "
+                                    "retry %d/%d ...", subject, e,
+                                    attempt + 1, retries)
+                    time.sleep(2)
+                else:
+                    raise RuntimeError(
+                        f"Schema registration failed for '{subject}' "
+                        f"after {retries} attempts: {e}"
+                    ) from e
+        return -1  # unreachable, keeps linter quiet
+
+
+avro_serializer: AvroSerializer | None = None
 
 
 def setup_logging() -> None:
@@ -73,7 +143,7 @@ def create_kafka_producer() -> KafkaProducer:
             p = KafkaProducer(
                 bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
                 key_serializer=lambda k: k.encode("utf-8") if isinstance(k, str) else k,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                # value is pre-serialized as Avro bytes by AvroSerializer
                 acks=1,
                 compression_type="lz4",
                 linger_ms=5,
@@ -104,7 +174,12 @@ def send_to_kafka(topic: str, record: Dict[str, Any]) -> None:
     key: str = record.get("symbol", "")
 
     try:
-        future = producer.send(topic, key=key, value=record)
+        value_bytes = (
+            avro_serializer.serialize(topic, record)
+            if avro_serializer
+            else json.dumps(record).encode("utf-8")
+        )
+        future = producer.send(topic, key=key, value=value_bytes)
         future.add_errback(_on_send_error, topic, key)
     except KafkaError as e:
         logging.error("[KAFKA] Sync send error (dropped message) | topic=%s symbol=%s error=%s", topic, key, e)
@@ -114,19 +189,19 @@ def send_to_kafka(topic: str, record: Dict[str, Any]) -> None:
 
 def map_ticker(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "event_time":           raw["E"],
-        "symbol":               raw["s"],
+        "event_time":           int(raw["E"]),
+        "symbol":               str(raw["s"]),
         "close":                float(raw.get("c", 0)),
         "bid":                  float(raw.get("b", 0)),
         "ask":                  float(raw.get("a", 0)),
-        "24h_open":             float(raw.get("o", 0)),
-        "24h_high":             float(raw.get("h", 0)),
-        "24h_low":              float(raw.get("l", 0)),
-        "24h_volume":           float(raw.get("v", 0)),
-        "24h_quote_volume":     float(raw.get("q", 0)),
-        "24h_price_change":     float(raw.get("p", 0)),
-        "24h_price_change_pct": float(raw.get("P", 0)),
-        "24h_trade_count":      int(raw.get("n", 0)),
+        "h24_open":             float(raw.get("o", 0)),
+        "h24_high":             float(raw.get("h", 0)),
+        "h24_low":              float(raw.get("l", 0)),
+        "h24_volume":           float(raw.get("v", 0)),
+        "h24_quote_volume":     float(raw.get("q", 0)),
+        "h24_price_change":     float(raw.get("p", 0)),
+        "h24_price_change_pct": float(raw.get("P", 0)),
+        "h24_trade_count":      int(raw.get("n", 0)),
     }
 
 
@@ -199,12 +274,12 @@ def run_ticker_stream() -> None:
 
 def map_agg_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "event_time":     raw["E"],
-        "symbol":         raw["s"],
-        "agg_trade_id":   raw["a"],
+        "event_time":     int(raw["E"]),
+        "symbol":         str(raw["s"]),
+        "agg_trade_id":   int(raw["a"]),
         "price":          float(raw["p"]),
         "quantity":       float(raw["q"]),
-        "trade_time":     raw["T"],
+        "trade_time":     int(raw["T"]),
         "is_buyer_maker": bool(raw["m"]),
     }
 
@@ -272,11 +347,11 @@ def run_agg_trade_batch(stream_url: str, batch_idx: int) -> None:
 def map_kline(raw: Dict[str, Any]) -> Dict[str, Any]:
     k = raw["k"]
     return {
-        "event_time":   raw["E"],
-        "symbol":       raw["s"],
-        "kline_start":  k["t"],
-        "kline_close":  k["T"],
-        "interval":     k["i"],
+        "event_time":   int(raw["E"]),
+        "symbol":       str(raw["s"]),
+        "kline_start":  int(k["t"]),
+        "kline_close":  int(k["T"]),
+        "interval":     str(k["i"]),
         "open":         float(k["o"]),
         "high":         float(k["h"]),
         "low":          float(k["l"]),
@@ -355,13 +430,15 @@ def run_kline_batch(stream_url: str, batch_idx: int) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def map_depth(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Map Binance partial depth event to Kafka record."""
+    """Map Binance partial depth event to Kafka record.
+    bids/asks are JSON-encoded strings for Avro compatibility.
+    """
     return {
-        "event_time":    raw.get("E", int(time.time() * 1000)),
-        "symbol":        raw.get("s", ""),
-        "last_update_id": raw.get("lastUpdateId", 0),
-        "bids":          [[float(p), float(q)] for p, q in raw.get("bids", [])],
-        "asks":          [[float(p), float(q)] for p, q in raw.get("asks", [])],
+        "event_time":     int(raw.get("E", int(time.time() * 1000))),
+        "symbol":         str(raw.get("s", "")),
+        "last_update_id": int(raw.get("lastUpdateId", 0)),
+        "bids":           json.dumps([[float(p), float(q)] for p, q in raw.get("bids", [])]),
+        "asks":           json.dumps([[float(p), float(q)] for p, q in raw.get("asks", [])]),
     }
 
 
@@ -441,6 +518,21 @@ def run() -> None:
 
     global producer
     producer = create_kafka_producer()
+
+    # ── Register Avro schemas with Schema Registry ───────────────────────────
+    global avro_serializer
+    schema_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "schemas")
+    avro_serializer = AvroSerializer(SCHEMA_REGISTRY_URL)
+    avro_serializer.register(KAFKA_TOPIC_TICKER,
+                             os.path.join(schema_dir, "ticker.avsc"))
+    avro_serializer.register(KAFKA_TOPIC_KLINES,
+                             os.path.join(schema_dir, "kline.avsc"))
+    avro_serializer.register(KAFKA_TOPIC_TRADES,
+                             os.path.join(schema_dir, "trade.avsc"))
+    avro_serializer.register(KAFKA_TOPIC_DEPTH,
+                             os.path.join(schema_dir, "depth.avsc"))
+    logging.info("All Avro schemas registered.")
 
     ticker_thread = threading.Thread(
         target=run_ticker_stream,

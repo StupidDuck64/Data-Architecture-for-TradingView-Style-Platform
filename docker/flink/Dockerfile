@@ -13,8 +13,11 @@ RUN pip3 install --no-cache-dir \
     redis==5.0.3
 
 # ── Kafka SQL connector JAR (Flink 1.18) ─────────────────────────────────────
+# Avro Confluent Registry format JAR (for avro-confluent deserialization)
 RUN wget -q -P /opt/flink/lib/ \
-    https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar
+    https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.1.0-1.18/flink-sql-connector-kafka-3.1.0-1.18.jar && \
+    wget -q -P /opt/flink/lib/ \
+    https://repo1.maven.org/maven2/org/apache/flink/flink-sql-avro-confluent-registry/1.18.1/flink-sql-avro-confluent-registry-1.18.1.jar
 
 # ── Flink config ──────────────────────────────────────────────────────────────
 COPY flink-conf.yaml /opt/flink/conf/flink-conf.yaml

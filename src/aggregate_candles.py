@@ -2,37 +2,28 @@
 """
 aggregate_candles.py
 ────────────────────
-Các job aggregation nến:
+Gộp nến 1m → 1h để giảm dữ liệu phình.
+Chạy trên cả InfluxDB (real-time layer) và Iceberg (data lake).
 
-  1s → 1m  :  Đọc nến 1s từ KeyDB, gộp OHLCV thành 1m, ghi KeyDB + InfluxDB.
-               Chạy mỗi phút qua cron.
-  1m → 1h  :  InfluxDB hoặc Iceberg — gộp nến 1m cũ thành 1h, xoá 1m.
-               Chạy qua Dagster schedule hoặc manual.
+Lưu ý: việc gộp 1s → 1m đã được xử lý in-flight bởi Flink
+(KlineWindowAggregator) — không cần cron riêng.
 
 Usage:
-    python aggregate_candles.py --mode 1s-to-1m                  # cron mỗi phút
     python aggregate_candles.py --mode influx                    # 1m→1h InfluxDB
     python aggregate_candles.py --mode iceberg                   # 1m→1h Iceberg
-    python aggregate_candles.py --mode all                       # cả 2 (1m→1h)
+    python aggregate_candles.py --mode all                       # cả 2 (default)
     python aggregate_candles.py --mode all --retention-days 7
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
-
-import redis
+from datetime import datetime, timezone
 
 # ─── Config ──────────────────────────────────────────────────────────────────
-
-REDIS_HOST   = os.environ.get("REDIS_HOST",   "keydb")
-REDIS_PORT   = int(os.environ.get("REDIS_PORT", "6379"))
 
 INFLUX_URL    = os.environ.get("INFLUX_URL",    "http://influxdb:8086")
 INFLUX_TOKEN  = os.environ.get("INFLUX_TOKEN",  "")
@@ -45,8 +36,6 @@ MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "minioadmin")
 
 RETENTION_1M_DAYS = int(os.environ.get("RETENTION_1M_DAYS", "7"))
 
-TTL_1M_SEC = 604_800  # 7 ngày — TTL cho candle:1m trong KeyDB
-
 ICEBERG_KLINES         = "iceberg_catalog.crypto_lakehouse.coin_klines"
 ICEBERG_KLINES_HOURLY  = "iceberg_catalog.crypto_lakehouse.coin_klines_hourly"
 
@@ -56,97 +45,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("aggregate_candles")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1s → 1m  AGGREGATION  (KeyDB + InfluxDB)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def aggregate_1s_to_1m() -> None:
-    """Đọc nến 1s từ KeyDB, gộp OHLCV thành nến 1m, ghi vào KeyDB + InfluxDB."""
-    from influxdb_client import InfluxDBClient, Point, WritePrecision
-    from influxdb_client.client.write_api import SYNCHRONOUS
-
-    r = redis.Redis(
-        host=REDIS_HOST, port=REDIS_PORT, db=0,
-        decode_responses=True, socket_keepalive=True,
-    )
-    influx = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-    write_api = influx.write_api(write_options=SYNCHRONOUS)
-
-    # Phút vừa hoàn thành
-    now = datetime.now(timezone.utc)
-    last_minute = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
-    start_ms = int(last_minute.timestamp() * 1000)
-    end_ms   = start_ms + 60_000
-
-    log.info(
-        "1s→1m aggregation for minute: %s",
-        last_minute.strftime("%Y-%m-%d %H:%M:%S UTC"),
-    )
-
-    # Lấy danh sách symbol có data 1s
-    symbols: List[str] = []
-    for key in r.scan_iter(match="candle:1s:*", count=100):
-        symbols.append(key.split(":", 2)[2])
-
-    log.info("Found %d symbols with 1s data.", len(symbols))
-    success = 0
-
-    for symbol in symbols:
-        candles_json = r.zrangebyscore(
-            f"candle:1s:{symbol}", start_ms, end_ms - 1,
-        )
-        if not candles_json:
-            continue
-
-        candles = [json.loads(c) for c in candles_json]
-        if not candles:
-            continue
-
-        # OHLCV aggregation
-        agg = {
-            "t":  start_ms,
-            "o":  candles[0]["o"],
-            "h":  max(c["h"] for c in candles),
-            "l":  min(c["l"] for c in candles),
-            "c":  candles[-1]["c"],
-            "v":  sum(c["v"] for c in candles),
-            "qv": sum(c["qv"] for c in candles),
-            "n":  sum(c["n"] for c in candles),
-            "x":  True,
-        }
-
-        # ── Ghi KeyDB ────────────────────────────────────────────────────
-        key_1m = f"candle:1m:{symbol}"
-        pipe = r.pipeline()
-        pipe.zadd(key_1m, {json.dumps(agg): start_ms})
-        pipe.zremrangebyscore(key_1m, 0, start_ms - TTL_1M_SEC * 1000)
-        pipe.expire(key_1m, TTL_1M_SEC)
-        pipe.execute()
-
-        # ── Ghi InfluxDB ─────────────────────────────────────────────────
-        point = (
-            Point("candles")
-            .tag("symbol",   symbol)
-            .tag("exchange", "binance")
-            .tag("interval", "1m")
-            .field("open",         float(agg["o"]))
-            .field("high",         float(agg["h"]))
-            .field("low",          float(agg["l"]))
-            .field("close",        float(agg["c"]))
-            .field("volume",       float(agg["v"]))
-            .field("quote_volume", float(agg["qv"]))
-            .field("trade_count",  int(agg["n"]))
-            .field("is_closed",    True)
-            .time(start_ms, WritePrecision.MS)
-        )
-        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-        success += 1
-
-    log.info("1s→1m done: %d / %d symbols aggregated.", success, len(symbols))
-    r.close()
-    influx.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -477,10 +375,10 @@ def aggregate_iceberg():
 def main():
     global RETENTION_1M_DAYS
 
-    parser = argparse.ArgumentParser(description="Aggregate candles: 1s→1m or 1m→1h")
+    parser = argparse.ArgumentParser(description="Aggregate 1m candles → 1h candles")
     parser.add_argument(
-        "--mode", choices=["1s-to-1m", "influx", "iceberg", "all"], default="all",
-        help="1s-to-1m: nến giây→phút  |  influx/iceberg/all: nến phút→giờ (default: all)",
+        "--mode", choices=["influx", "iceberg", "all"], default="all",
+        help="Which backend to aggregate (default: all)",
     )
     parser.add_argument(
         "--retention-days", type=int, default=None,
@@ -491,18 +389,8 @@ def main():
     if args.retention_days is not None:
         RETENTION_1M_DAYS = args.retention_days
 
-    log.info("=== Candle Aggregation | mode=%s ===", args.mode)
-
-    if args.mode == "1s-to-1m":
-        try:
-            aggregate_1s_to_1m()
-        except Exception as e:
-            log.error("1s→1m aggregation failed: %s", e)
-        log.info("=== Aggregation complete ===")
-        return
-
-    # ── Các mode 1m→1h ──────────────────────────────────────────────────
-    log.info("Retention: %d days", RETENTION_1M_DAYS)
+    log.info("=== Candle Aggregation: 1m → 1h | retention=%d days | mode=%s ===",
+             RETENTION_1M_DAYS, args.mode)
 
     if args.mode in ("influx", "all"):
         try:
