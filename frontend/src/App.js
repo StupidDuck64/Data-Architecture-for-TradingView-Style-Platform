@@ -10,14 +10,14 @@ import { useI18n } from "./i18n";
 import { useAuth } from "./contexts/AuthContext";
 
 const watchlistItems = [
-  { symbol: "NIFTY", price: 23467, change: -0.53, color: "red" },
-  { symbol: "BANKNIFTY", price: 51613.35, change: -0.27, color: "red" },
-  { symbol: "SPX", price: 5464.61, change: -0.16, color: "red" },
-  { symbol: "BTCUSD", price: 64444, change: 0.33, color: "green" },
-  { symbol: "VIX", price: 13.2, change: -0.6, color: "red" },
-  { symbol: "XAUUSD", price: 2321.875, change: -1.62, color: "red" },
-  { symbol: "WTICOUS", price: 80.952, change: -0.83, color: "red" },
-  { symbol: "USDJPY", price: 159.76, change: 0.54, color: "green" },
+  { symbol: "BTCUSDT", price: 64444, change: 0.33, color: "green" },
+  { symbol: "ETHUSDT", price: 3400, change: -0.53, color: "red" },
+  { symbol: "BNBUSDT", price: 580, change: -0.27, color: "red" },
+  { symbol: "SOLUSDT", price: 165, change: 0.54, color: "green" },
+  { symbol: "XRPUSDT", price: 2.35, change: -0.16, color: "red" },
+  { symbol: "DOGEUSDT", price: 0.158, change: -0.6, color: "red" },
+  { symbol: "ADAUSDT", price: 0.72, change: -0.83, color: "red" },
+  { symbol: "AVAXUSDT", price: 35.2, change: 0.33, color: "green" },
 ];
 
 // LocalStorage helpers for user customization
@@ -40,9 +40,12 @@ const TradingDashboard = () => {
   const { user, logout } = useAuth();
   const [activeTool, setActiveTool] = useState("cursor");
   const [drawings, setDrawings] = useState([]);
-  const [selectedSymbol, setSelectedSymbol] = useState(() =>
-    loadFromStorage("app_selectedSymbol", "BTCUSD"),
-  );
+  const [selectedSymbol, setSelectedSymbol] = useState(() => {
+    const stored = loadFromStorage("app_selectedSymbol", "BTCUSDT");
+    // Migrate legacy symbol names (e.g. BTCUSD → BTCUSDT)
+    if (stored && !stored.endsWith("USDT")) return "BTCUSDT";
+    return stored;
+  });
   const [toolSettings, setToolSettings] = useState(() =>
     loadFromStorage(
       "app_toolSettings",

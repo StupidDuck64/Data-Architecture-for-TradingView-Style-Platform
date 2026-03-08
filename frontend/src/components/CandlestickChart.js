@@ -43,18 +43,18 @@ const THEME = {
 
 // ─── Math helpers ─────────────────────────────────────────────────
 const SYMBOLS = [
-  "BTCUSD",
-  "ETHUSD",
-  "BNBUSD",
+  "BTCUSDT",
+  "ETHUSDT",
+  "BNBUSDT",
   "SOLUSDT",
-  "XAUUSD",
-  "SPX",
-  "NASDAQ",
-  "NIFTY",
-  "BANKNIFTY",
-  "VIX",
-  "WTICOUS",
-  "USDJPY",
+  "XRPUSDT",
+  "DOGEUSDT",
+  "ADAUSDT",
+  "AVAXUSDT",
+  "DOTUSDT",
+  "LINKUSDT",
+  "MATICUSDT",
+  "LTCUSDT",
 ];
 const TIMEFRAMES = ["1s", "1m", "5m", "15m", "1H", "4H", "1D", "1W"];
 const CHART_TABS = ["candlestick", "overview", "orderBook", "recentTrades"];
@@ -478,7 +478,7 @@ const OHLCVBar = ({ data }) => {
 };
 
 const CandlestickChart = ({
-  defaultSymbol = "BTCUSD",
+  defaultSymbol = "BTCUSDT",
   symbol: symbolProp,
   children,
   starredSymbols = [],
@@ -495,7 +495,7 @@ const CandlestickChart = ({
   const emaRef = useRef(null);
 
   const [symbol, setSymbol] = useState(symbolProp || defaultSymbol);
-  const [timeframe, setTimeframe] = useState("1H");
+  const [timeframe, setTimeframe] = useState("1m");
   const [tooltip, setTooltip] = useState(null);
   const [showIndPanel, setShowIndPanel] = useState(false);
   const [indSettings, setIndSettings] = useState(() =>

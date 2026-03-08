@@ -58,18 +58,18 @@ function generateMockCandles(symbol, timeframeKey, count = 200) {
 
   // Seed prices per symbol so they feel realistic
   const seedPrices = {
-    BTCUSD: 64000,
-    ETHUSD: 3400,
-    BNBUSD: 580,
+    BTCUSDT: 64000,
+    ETHUSDT: 3400,
+    BNBUSDT: 580,
     SOLUSDT: 165,
-    XAUUSD: 2320,
-    SPX: 5464,
-    NASDAQ: 19700,
-    NIFTY: 23467,
-    BANKNIFTY: 51613,
-    VIX: 13.2,
-    WTICOUS: 80.95,
-    USDJPY: 159.76,
+    XRPUSDT: 2.35,
+    DOGEUSDT: 0.158,
+    ADAUSDT: 0.72,
+    AVAXUSDT: 35.2,
+    DOTUSDT: 7.5,
+    LINKUSDT: 18.5,
+    MATICUSDT: 0.72,
+    LTCUSDT: 95,
     default: 100,
   };
 
@@ -192,17 +192,17 @@ export async function fetchSymbols() {
   }
 
   return [
-    { symbol: "BTCUSD", name: "Bitcoin / USD", type: "crypto" },
-    { symbol: "ETHUSD", name: "Ethereum / USD", type: "crypto" },
-    { symbol: "BNBUSD", name: "BNB / USD", type: "crypto" },
+    { symbol: "BTCUSDT", name: "Bitcoin / USDT", type: "crypto" },
+    { symbol: "ETHUSDT", name: "Ethereum / USDT", type: "crypto" },
+    { symbol: "BNBUSDT", name: "BNB / USDT", type: "crypto" },
     { symbol: "SOLUSDT", name: "Solana / USDT", type: "crypto" },
-    { symbol: "XAUUSD", name: "Gold / USD", type: "commodity" },
-    { symbol: "SPX", name: "S&P 500", type: "index" },
-    { symbol: "NASDAQ", name: "Nasdaq 100", type: "index" },
-    { symbol: "NIFTY", name: "Nifty 50", type: "index" },
-    { symbol: "BANKNIFTY", name: "Bank Nifty", type: "index" },
-    { symbol: "VIX", name: "Volatility Index", type: "index" },
-    { symbol: "WTICOUS", name: "WTI Crude Oil / USD", type: "commodity" },
-    { symbol: "USDJPY", name: "USD / JPY", type: "forex" },
+    { symbol: "XRPUSDT", name: "XRP / USDT", type: "crypto" },
+    { symbol: "DOGEUSDT", name: "Dogecoin / USDT", type: "crypto" },
+    { symbol: "ADAUSDT", name: "Cardano / USDT", type: "crypto" },
+    { symbol: "AVAXUSDT", name: "Avalanche / USDT", type: "crypto" },
+    { symbol: "DOTUSDT", name: "Polkadot / USDT", type: "crypto" },
+    { symbol: "LINKUSDT", name: "Chainlink / USDT", type: "crypto" },
+    { symbol: "MATICUSDT", name: "Polygon / USDT", type: "crypto" },
+    { symbol: "LTCUSDT", name: "Litecoin / USDT", type: "crypto" },
   ];
 }

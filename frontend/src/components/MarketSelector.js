@@ -3,18 +3,18 @@ import { Search, ChevronDown, Star } from 'lucide-react';
 import { useI18n } from '../i18n';
 
 const SYMBOL_META = {
-  BTCUSD:    { icon: '₿', category: 'crypto',      name: 'Bitcoin' },
-  ETHUSD:    { icon: 'Ξ', category: 'crypto',      name: 'Ethereum' },
-  BNBUSD:    { icon: '◆', category: 'crypto',      name: 'BNB' },
-  SOLUSDT:   { icon: '◎', category: 'crypto',      name: 'Solana' },
-  XAUUSD:    { icon: '🥇', category: 'commodities', name: 'Gold' },
-  SPX:       { icon: '📊', category: 'indices',     name: 'S&P 500' },
-  NASDAQ:    { icon: '📈', category: 'indices',     name: 'Nasdaq 100' },
-  NIFTY:     { icon: '🇮🇳', category: 'indices',     name: 'Nifty 50' },
-  BANKNIFTY: { icon: '🏦', category: 'indices',     name: 'Bank Nifty' },
-  VIX:       { icon: '⚡', category: 'indices',     name: 'Volatility Index' },
-  WTICOUS:   { icon: '🛢️', category: 'commodities', name: 'Crude Oil WTI' },
-  USDJPY:    { icon: '💱', category: 'forex',       name: 'USD/JPY' },
+  BTCUSDT:    { icon: '₿', category: 'crypto', name: 'Bitcoin' },
+  ETHUSDT:    { icon: 'Ξ', category: 'crypto', name: 'Ethereum' },
+  BNBUSDT:    { icon: '◆', category: 'crypto', name: 'BNB' },
+  SOLUSDT:    { icon: '◎', category: 'crypto', name: 'Solana' },
+  XRPUSDT:    { icon: '✕', category: 'crypto', name: 'XRP' },
+  DOGEUSDT:   { icon: '🐕', category: 'crypto', name: 'Dogecoin' },
+  ADAUSDT:    { icon: '◈', category: 'crypto', name: 'Cardano' },
+  AVAXUSDT:   { icon: '▲', category: 'crypto', name: 'Avalanche' },
+  DOTUSDT:    { icon: '●', category: 'crypto', name: 'Polkadot' },
+  LINKUSDT:   { icon: '⬡', category: 'crypto', name: 'Chainlink' },
+  MATICUSDT:  { icon: '⬟', category: 'crypto', name: 'Polygon' },
+  LTCUSDT:    { icon: 'Ł', category: 'crypto', name: 'Litecoin' },
 };
 
 const CATEGORIES = ['all', 'crypto', 'indices', 'commodities', 'forex'];

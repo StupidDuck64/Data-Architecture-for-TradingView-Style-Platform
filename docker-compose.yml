@@ -64,6 +64,30 @@ services:
       retries: 10
       start_period: 30s
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCHEMA REGISTRY  (Apicurio — Confluent-compatible API)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+  schema-registry:
+    image: apicurio/apicurio-registry-mem:2.6.2.Final
+    container_name: schema-registry
+    hostname: schema-registry
+    ports:
+      - "8085:8080"
+    environment:
+      QUARKUS_HTTP_PORT: 8080
+    networks:
+      - crypto-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -419,7 +443,7 @@ services:
       fastapi:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
       interval: 15s
       timeout: 5s
       retries: 3
