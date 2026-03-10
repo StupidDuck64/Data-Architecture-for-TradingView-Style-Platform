@@ -71,7 +71,7 @@ This project implements a **Lambda Architecture** for a real-time cryptocurrency
 │  │  ─────────────────── │    JSON   │  ┌──────────────┬──────────────────────────┐ │     │
 │  │  4 WebSocket threads │──────────▶│  │crypto_ticker │ crypto_trades            │ │     │
 │  │  LZ4-compressed msgs │           │  │crypto_klines │ crypto_depth             │ │     │
-│  │  Auto-reconnect      │           │  │ (3 partitions each, 7-day retention)    │ │     │
+│  │  Auto-reconnect      │           │  │ (3 partitions each, 2-day retention)    │ │     │
 │  └──────────────────────┘           │  └──────────────┴──────────────────────────┘ │     │
 │                                     └───────────┬──────────────────────────────────┘     │
 │                                                 │                                       │
@@ -636,40 +636,42 @@ KafkaProducer(
 
 ### 7.2. Flink Streaming (`ingest_flink_crypto.py`)
 
-The core speed layer, consuming 3 Kafka topics (ticker, trades, klines) plus depth, and writing to 3 sinks in parallel.
+The core speed layer, consuming 4 Kafka topics (ticker, trades, klines, depth) and writing to KeyDB + InfluxDB in parallel via PyFlink `FlatMapFunction` sinks.
 
-**Processing Pipeline per Stream**:
+**Cluster Configuration** (optimized for t3a.2xlarge):
 
-1. Read from Kafka as structured streaming DataFrame
-2. Parse JSON with schema inference
-3. Extract and cast fields (timestamps, decimals)
-4. Add watermark (1–2 minutes) for late-arrival handling
-5. Drop duplicates within watermark window
-6. `foreachBatch` → parallel writes to KeyDB + InfluxDB + Iceberg
+| Setting                             | Value   | Purpose                                            |
+| ----------------------------------- | ------- | -------------------------------------------------- |
+| `taskmanager.memory.process.size`   | 4096m   | JVM + off-heap for 12 tasks                        |
+| `taskmanager.numberOfTaskSlots`     | 4       | Allows 12 tasks on 3 parallel pipelines            |
+| `parallelism.default`              | 3       | Matches 3 Kafka partitions per topic               |
+| `execution.checkpointing.interval` | 120s    | Balanced checkpoint frequency                      |
 
-**KeyDB Write Strategy**:
+**Processing Pipeline**:
+
+1. Read from Kafka topic via `FlinkKafkaConsumer` (JSON, 3 partitions)
+2. Parse JSON in `FlatMapFunction.flat_map()`
+3. Batch-buffer records (50–100 per flush, 0.3–0.5s interval)
+4. Flush via Redis `pipeline()` to minimize round trips
+
+**KeyDB Write Strategy** (all writers use batch-buffered pipelines):
 
 ```python
-# Ticker: HSET (overwrite latest) + ZADD (append history)
+# Ticker (KeyDBWriter): batch 100 records, flush 0.5s
 pipe.hset(f"ticker:latest:{symbol}", mapping={...})
 pipe.zadd(f"ticker:history:{symbol}", {f"{price}:{vol}": ts})
+# ZREMRANGEBYSCORE cleanup every 60 writes per symbol
 
-# Candles: similar dual-write pattern
+# Candles (KeyDBKlineWriter): batch 50 records, flush 0.5s
 pipe.hset(f"candle:latest:{symbol}", mapping={...})
 pipe.zadd(f"candle:history:{symbol}", {json.dumps(candle): kline_start})
 
-# Order Book: HSET with 60s TTL
-pipe.hset(f"orderbook:{symbol}", mapping={
-    "bids": json.dumps(top20_bids),
-    "asks": json.dumps(top20_asks),
-    "best_bid": ..., "best_ask": ..., "spread": ...
-})
+# Order Book (DepthWriter): batch 50 records, flush 0.3s
+pipe.hset(f"orderbook:{symbol}", mapping={bids, asks, spread...})
 pipe.expire(f"orderbook:{symbol}", 60)
 ```
 
-**InfluxDB Write Strategy**: Batched — flush every 200 events OR every 5 seconds.
-
-**Iceberg Write Strategy**: Append mode, 1-minute trigger, checkpoint to MinIO.
+**InfluxDB Write Strategy**: Batched via `write_api(SYNCHRONOUS)` — one write per record with large InfluxDB server-side batching.
 
 ---
 
@@ -1228,8 +1230,8 @@ docker compose up -d trino dagster-webserver dagster-daemon
 # Phase 4: Producer + Backfill
 docker compose up -d producer influx-backfill
 
-# Phase 5: Submit Flink job
-docker exec flink-jobmanager flink run -py /app/src/ingest_flink_crypto.py -d
+# Phase 5: Submit Flink job (parallelism=3, 4 slots)
+docker exec -d flink-jobmanager bash -c "cd /app && /opt/flink/bin/flink run -py src/ingest_flink_crypto.py -d"
 
 # Phase 6: Serving layer (FastAPI waits for keydb + influxdb + trino healthy)
 docker compose up -d fastapi nginx
@@ -1269,26 +1271,27 @@ REDIS_PORT=6379
 
 ### 9.6. Resource Requirements
 
-| Service        | Memory (Config) | Memory (Actual) |       CPU        |
-| -------------- | :-------------: | :-------------: | :--------------: |
-| Kafka          |      ~1GB       |     ~800MB      |      1 core      |
-| MinIO          |     ~512MB      |     ~300MB      |     0.5 core     |
-| InfluxDB       |      ~1GB       |     ~600MB      |      1 core      |
-| PostgreSQL     |     ~256MB      |     ~100MB      |     0.5 core     |
-| KeyDB          |     ~256MB      |     ~100MB      |     0.5 core     |
-| Flink JM       |      1.6GB      |     ~1.2GB      |      1 core      |
-| Flink TM       |      1.7GB      |     ~1.4GB      |     2 slots      |
-| Spark Master   |     ~512MB      |     ~300MB      |     0.5 core     |
-| Spark Worker   |       3GB       |      ~2GB       |     2 cores      |
-| Trino          |       2GB       |     ~1.5GB      |      1 core      |
-| Dagster WS     |     ~512MB      |     ~300MB      |     0.5 core     |
-| Dagster Daemon |     ~512MB      |     ~300MB      |     0.5 core     |
-| Producer       |     ~128MB      |      ~80MB      |     0.5 core     |
-| **FastAPI**    |   **~256MB**    |   **~150MB**    |   **0.5 core**   |
-| **Nginx**      |    **~64MB**    |    **~30MB**    |  **0.25 core**   |
-| **Total**      |   **~12.3GB**   |   **~9.2GB**    | **~11.25 cores** |
+| Service        | Memory (Config) | Memory (Actual) |       CPU        | Notes                                      |
+| -------------- | :-------------: | :-------------: | :--------------: | ------------------------------------------ |
+| Kafka          |      ~1GB       |      ~1GB       |     2 cores      | KRaft, LZ4, 48h retention                  |
+| MinIO          |     ~512MB      |      ~86MB      |     0.1 core     | S3-compatible storage                      |
+| InfluxDB       |      ~1GB       |     ~110MB      |     0.5 core     | Time-series                                |
+| PostgreSQL     |     ~256MB      |      ~22MB      |     0.1 core     | Iceberg catalog + Dagster                  |
+| KeyDB          |       1GB       |      ~26MB      |     0.2 core     | maxmemory 1GB, LRU eviction, hz 50         |
+| Flink JM       |      1.6GB      |     ~448MB      |     0.5 core     | Container cap 1.75GB                       |
+| Flink TM       |      4.1GB      |     ~2.2GB      |     3 cores      | 4 slots, parallelism=3, cap 4.5GB          |
+| Spark Master   |     ~512MB      |     ~764MB      |     0.3 core     | Driver + scheduler                         |
+| Spark Worker   |       4GB       |     ~244MB      |     0.1 core     | cores.max=2                                |
+| Trino          |       1GB       |     ~1.1GB      |     0.5 core     | Xmx 1GB (infrequent historical queries)    |
+| Dagster WS     |     ~512MB      |     ~203MB      |     0.5 core     | UI + metadata                              |
+| Dagster Daemon |     ~512MB      |     ~274MB      |     0.5 core     | Scheduler loop                             |
+| Producer       |     ~128MB      |      ~77MB      |     1.5 cores    | 4 WS threads to Binance                    |
+| **FastAPI**    |   **~256MB**    |   **~143MB**    |  **0.3 core**    | 2 Uvicorn workers                          |
+| **Nginx**      |    **~64MB**    |    **~7MB**     |  **0.1 core**    | Reverse proxy + gzip                       |
+| **Total**      |  **~16.5GB**    |   **~6.7GB**    |  **~10 cores**   | On t3a.2xlarge (8 vCPU, 32GB, 100GB gp3)  |
 
-**Minimum System Requirements**: 16GB RAM, 6+ CPU cores, 50GB+ disk
+**Current Deployment**: AWS EC2 t3a.2xlarge — 8 AMD vCPU, 32GB RAM, 100GB gp3, Singapore (ap-southeast-1)
+**Minimum System Requirements**: 16GB RAM, 4+ CPU cores, 50GB+ disk
 
 ---
 
@@ -1538,7 +1541,7 @@ PARTITIONED BY (symbol, years(event_time));
 | Trades               | Iceberg `coin_trades`        | Permanent                                 |
 | Order Book           | KeyDB only                   | 60s TTL                                   |
 | Indicators           | KeyDB + InfluxDB             | Latest in KeyDB, time-series in InfluxDB  |
-| Kafka topics         | Kafka                        | 7 days (`KAFKA_LOG_RETENTION_HOURS: 168`) |
+| Kafka topics         | Kafka                        | 2 days (`KAFKA_LOG_RETENTION_HOURS: 48`) |
 | Iceberg snapshots    | MinIO/S3                     | 48h (then expired)                        |
 | Iceberg orphan files | MinIO/S3                     | 72h (then cleaned)                        |
 

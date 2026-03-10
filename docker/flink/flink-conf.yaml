@@ -8,11 +8,11 @@ jobmanager.execution.failover-strategy: region
 # ─── TaskManager ──────────────────────────────────────────────────────────────
 taskmanager.bind-host: 0.0.0.0
 taskmanager.host: flink-taskmanager
-taskmanager.memory.process.size: 1728m
-taskmanager.numberOfTaskSlots: 2
+taskmanager.memory.process.size: 4096m
+taskmanager.numberOfTaskSlots: 4
 
 # ─── Parallelism ──────────────────────────────────────────────────────────────
-parallelism.default: 1
+parallelism.default: 3
 
 # ─── REST ─────────────────────────────────────────────────────────────────────
 rest.address: 0.0.0.0

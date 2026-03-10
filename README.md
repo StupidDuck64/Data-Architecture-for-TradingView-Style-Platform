@@ -23,10 +23,10 @@ Dagster (scheduled):
 
 ## Yêu cầu
 
-- Docker Desktop >= 4.x (WSL2)
-- RAM: 16 GB+ (khuyến nghị 20 GB)
-- Disk: 20 GB free
-- CPU: 6 cores+
+- Docker Engine >= 24.x hoặc Docker Desktop >= 4.x
+- RAM: 16 GB+ (khuyến nghị 32 GB — hiện deploy trên **t3a.2xlarge**: 8 vCPU AMD, 32 GB RAM)
+- Disk: 50 GB+ free (hiện 100 GB gp3)
+- CPU: 4 cores+ (khuyến nghị 8 cores)
 
 ## Khởi động
 
@@ -39,13 +39,14 @@ cp .env.example .env
 docker compose up -d --build
 
 # 2. Submit Flink streaming job (6 writer: ticker/kline/indicator/depth → KeyDB + InfluxDB)
-docker exec flink-jobmanager flink run -d -py /app/src/ingest_flink_crypto.py
+#    Parallelism=3, 4 task slots — tối ưu cho 400 symbols
+docker exec -d flink-jobmanager bash -c "cd /app && /opt/flink/bin/flink run -py src/ingest_flink_crypto.py -d"
 
 # 3. Submit Spark streaming job (3 query: ticker/trades/klines → Iceberg)
-docker exec spark-master /opt/spark/bin/spark-submit \
+docker exec -d spark-master /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
-  --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5" \
-  --conf spark.driver.memory=2g --conf spark.executor.memory=2g \
+  --packages "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.apache.spark:spark-avro_2.12:3.5.5,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262" \
+  --conf spark.cores.max=2 \
   /app/src/ingest_crypto.py
 
 # 4. (Tuỳ chọn) Backfill dữ liệu lịch sử ngay, nếu không thì 2h sáng Dagster tự chạy
@@ -138,8 +139,10 @@ Tự chạy khi `docker compose up`. Kết nối **7 WebSocket** tới Binance c
 | :----- | :-------------- | :------------------------------------------------ | :---------------------- |
 | Ticker | `crypto_ticker` | Giá, bid/ask, volume 24h, % thay đổi              | ~2s/symbol              |
 | Trades | `crypto_trades` | Giao dịch aggregated (price, qty, buyer/seller)   | Real-time               |
-| Klines | `crypto_klines` | Nến OHLCV 1 phút (open, high, low, close, volume) | Mỗi giây + khi đóng nến |
+| Klines | `crypto_klines` | Nến OHLCV 1 giây (open, high, low, close, volume) | Mỗi giây + khi đóng nến |
 | Depth  | `crypto_depth`  | Order book 20 levels bid/ask                      | 100ms                   |
+
+Kafka: 3 partitions/topic, LZ4 compression, 48h retention.
 
 Giới hạn 200 symbols/connection để tránh bị Binance rate-limit (502). Tự reconnect khi mất kết nối.
 
@@ -266,28 +269,28 @@ Multi-stage Dockerfile: build React app (Node 20) → copy vào nginx:1.25-alpin
 
 ## Phân bổ tài nguyên
 
-| Service           | Image                      | RAM (config) | RAM (thực tế) |     CPU | Ghi chú                                  |
-| :---------------- | :------------------------- | -----------: | ------------: | ------: | :--------------------------------------- |
-| kafka             | apache/kafka:3.9.0         |       1.5 GB |       ~600 MB |     1.0 | KRaft mode, JVM heap ~1 GB               |
-| minio             | minio/minio:latest         |       1.0 GB |       ~300 MB |     0.5 | S3-compatible object storage             |
-| minio-init        | minio/mc:latest            |      64.0 MB |        ~30 MB |     0.1 | One-shot, tạo bucket rồi thoát           |
-| influxdb          | influxdb:2.7               |       1.5 GB |       ~500 MB |     0.5 | Time-series, org=vi, bucket=crypto       |
-| postgres          | postgres:16-alpine         |     512.0 MB |       ~200 MB |     0.5 | Iceberg catalog + Dagster metadata       |
-| keydb             | eqalpha/keydb:latest       |     512.0 MB |       ~150 MB |     0.5 | Redis-compatible in-memory cache         |
-| flink-jobmanager  | cryptoprice/flink:1.18.1   |       1.6 GB |       ~1.6 GB |     1.0 | `jobmanager.memory.process.size: 1600m`  |
-| flink-taskmanager | cryptoprice/flink:1.18.1   |       1.7 GB |       ~1.7 GB |     1.0 | `taskmanager.memory.process.size: 1728m` |
-| spark-master      | apache/spark:3.5.5         |       1.0 GB |       ~400 MB |     0.5 | Chỉ schedule, không chạy task            |
-| spark-worker      | apache/spark:3.5.5         |       4.0 GB |       ~3.5 GB |     2.0 | `SPARK_WORKER_MEMORY=3G`, 2 cores        |
-| trino             | trinodb/trino:442          |       2.0 GB |       ~1.5 GB |     1.0 | JVM `-Xmx2G`, query Iceberg trên MinIO   |
-| dagster-webserver | cryptoprice/dagster:latest |       1.0 GB |       ~500 MB |     0.5 | UI + metadata queries                    |
-| dagster-daemon    | cryptoprice/dagster:latest |     512.0 MB |       ~300 MB |     0.5 | Scheduler loop                           |
-| producer          | cryptoprice-producer       |     256.0 MB |       ~100 MB |     0.2 | Python WebSocket client                  |
-| fastapi           | cryptoprice/fastapi        |     256.0 MB |       ~120 MB |     0.3 | Uvicorn, REST API + WebSocket            |
-| nginx             | nginx:1.25-alpine          |     128.0 MB |        ~30 MB |     0.1 | Reverse proxy + SPA                      |
-|                   |                            |              |               |         |                                          |
-| **TỔNG**          |                            | **~17.6 GB** |  **~11.6 GB** | **9.7** |                                          |
+| Service           | Image                      | RAM (config) | RAM (thực tế) |     CPU | Ghi chú                                             |
+| :---------------- | :------------------------- | -----------: | ------------: | ------: | :--------------------------------------------------- |
+| kafka             | apache/kafka:3.9.0         |       1.5 GB |       ~1.0 GB |     2.0 | KRaft mode, LZ4 compression, 48h retention           |
+| minio             | minio/minio:latest         |       1.0 GB |        ~86 MB |     0.1 | S3-compatible object storage                         |
+| minio-init        | minio/mc:latest            |           — |            — |      — | One-shot, tạo bucket rồi thoát (restart: no)         |
+| influxdb          | influxdb:2.7               |       1.5 GB |       ~110 MB |     0.5 | Time-series, org=vi, bucket=crypto                   |
+| postgres          | postgres:16-alpine         |     512.0 MB |        ~22 MB |     0.1 | Iceberg catalog + Dagster metadata                   |
+| keydb             | eqalpha/keydb:latest       |       1.0 GB |        ~26 MB |     0.2 | maxmemory 1GB, LRU eviction, hz 50                   |
+| flink-jobmanager  | cryptoprice/flink:1.18.1   |       1.6 GB |       ~448 MB |     0.5 | `jobmanager.memory.process.size: 1600m` (cap 1.75G)  |
+| flink-taskmanager | cryptoprice/flink:1.18.1   |       4.1 GB |       ~2.2 GB |     3.0 | `process.size: 4096m`, 4 slots, parallelism=3        |
+| spark-master      | apache/spark:3.5.5         |       1.0 GB |       ~764 MB |     0.3 | Chỉ schedule + driver                                |
+| spark-worker      | apache/spark:3.5.5         |       4.0 GB |       ~244 MB |     0.1 | `SPARK_WORKER_MEMORY=4G`, cores.max=2                |
+| trino             | trinodb/trino:442          |       1.0 GB |       ~1.1 GB |     0.5 | JVM `-Xmx1G`, query Iceberg (hiếm dùng)             |
+| dagster-webserver | cryptoprice/dagster:latest |       1.0 GB |       ~203 MB |     0.5 | UI + metadata queries                                |
+| dagster-daemon    | cryptoprice/dagster:latest |     512.0 MB |       ~274 MB |     0.5 | Scheduler loop                                       |
+| producer          | cryptoprice-producer       |     256.0 MB |        ~77 MB |     1.5 | Python WebSocket client (4 WS threads)               |
+| fastapi           | cryptoprice/fastapi        |     256.0 MB |       ~143 MB |     0.3 | Uvicorn 2 workers, REST API + WebSocket              |
+| nginx             | nginx:1.25-alpine          |     128.0 MB |         ~7 MB |     0.1 | Reverse proxy + SPA + gzip                           |
+|                   |                            |              |               |         |                                                      |
+| **TỔNG**          |                            | **~18.5 GB** |   **~6.7 GB** | **9.4** | Trên t3a.2xlarge (8 vCPU, 32 GB RAM, 100 GB gp3)    |
 
-> Nếu máy chỉ có 16 GB RAM: tắt Trino (`docker compose stop trino`) giảm ~2 GB.
+> Nếu máy chỉ có 16 GB RAM: tắt Trino (`docker compose stop trino`) giảm ~1 GB.
 
 ## Lệnh thường dùng
 

@@ -39,18 +39,65 @@ log = logging.getLogger(__name__)
 
 
 class KeyDBWriter(FlatMapFunction):
+    """Batch-buffered ticker writer to KeyDB.
+    Accumulates ticker updates and flushes via a single pipeline.
+    """
+    BATCH_SIZE = 100
+    FLUSH_INTERVAL = 0.5
+    CLEANUP_EVERY = 60
+
     def open(self, runtime_context):
         self._r = redis.Redis(
             host=REDIS_HOST, port=REDIS_PORT, db=0,
             decode_responses=True,
             socket_keepalive=True,
         )
+        self._buffer: list[dict] = []
+        self._last_flush = time.time()
+        self._write_count: dict[str, int] = {}
 
     def close(self):
         try:
+            self._flush()
             self._r.close()
         except Exception as e:
             log.error("[KeyDB] close error: %s", e)
+
+    def _flush(self):
+        if not self._buffer:
+            return
+        try:
+            pipe = self._r.pipeline()
+            for value in self._buffer:
+                symbol = value["symbol"]
+                event_time = value["event_time"]
+                price = value["price"]
+                volume = value["volume"]
+                pipe.hset(
+                    f"ticker:latest:{symbol}",
+                    mapping={
+                        "price":      price,
+                        "bid":        value["bid"],
+                        "ask":        value["ask"],
+                        "volume":     volume,
+                        "change24h":  value["change24h"],
+                        "event_time": event_time,
+                    },
+                )
+                pipe.zadd(f"ticker:history:{symbol}", {f"{price}:{volume}": event_time})
+
+                count = self._write_count.get(symbol, 0) + 1
+                self._write_count[symbol] = count
+                if count % self.CLEANUP_EVERY == 0:
+                    cutoff = event_time - 300_000
+                    pipe.zremrangebyscore(f"ticker:history:{symbol}", 0, cutoff)
+            pipe.execute()
+        except Exception as e:
+            log.error("[KeyDB] flush error (dropped %d records): %s",
+                      len(self._buffer), e)
+        finally:
+            self._buffer.clear()
+            self._last_flush = time.time()
 
     def flat_map(self, value):
         try:
@@ -59,26 +106,20 @@ class KeyDBWriter(FlatMapFunction):
             symbol = value.get("symbol")
             if not symbol:
                 return []
-            event_time = int(value.get("event_time", 0))
-            price      = float(value.get("close", 0))
-            volume     = float(value.get("h24_volume", 0))
-            change_pct = float(value.get("h24_price_change_pct", 0))
-            cutoff     = event_time - 300_000
-            pipe = self._r.pipeline()
-            pipe.hset(
-                f"ticker:latest:{symbol}",
-                mapping={
-                    "price":      price,
-                    "bid":        float(value.get("bid", 0)),
-                    "ask":        float(value.get("ask", 0)),
-                    "volume":     volume,
-                    "change24h":  change_pct,
-                    "event_time": event_time,
-                },
-            )
-            pipe.zadd(f"ticker:history:{symbol}", {f"{price}:{volume}": event_time})
-            pipe.zremrangebyscore(f"ticker:history:{symbol}", 0, cutoff)
-            pipe.execute()
+            self._buffer.append({
+                "symbol":     symbol,
+                "event_time": int(value.get("event_time", 0)),
+                "price":      float(value.get("close", 0)),
+                "bid":        float(value.get("bid", 0)),
+                "ask":        float(value.get("ask", 0)),
+                "volume":     float(value.get("h24_volume", 0)),
+                "change24h":  float(value.get("h24_price_change_pct", 0)),
+            })
+            if (
+                len(self._buffer) >= self.BATCH_SIZE
+                or (time.time() - self._last_flush) >= self.FLUSH_INTERVAL
+            ):
+                self._flush()
         except Exception as e:
             s = value.get("symbol") if isinstance(value, dict) else "unknown"
             log.error("[KeyDB] flat_map error | symbol=%s error=%s", s, e)
@@ -86,7 +127,7 @@ class KeyDBWriter(FlatMapFunction):
 
 
 class InfluxDBWriter(FlatMapFunction):
-    def __init__(self, batch_size: int = 500, flush_interval_sec: float = 1.0):
+    def __init__(self, batch_size: int = 1000, flush_interval_sec: float = 2.0):
         self.batch_size = batch_size
         self.flush_interval_sec = flush_interval_sec
 
@@ -147,15 +188,17 @@ class KeyDBKlineWriter(FlatMapFunction):
     """Writes kline candles to KeyDB with interval-specific TTL:
     - candle:1s:{symbol} → TTL 2 hours (for 1-second candles)
     - candle:1m:{symbol} → TTL 7 days (for 1-minute candles)
-    - candle:latest:{symbol} → latest candle info (no TTL)
+    - candle:latest:{symbol} → latest candle info (only for 1m+, not 1s)
 
-    ZREMRANGEBYSCORE runs every CLEANUP_EVERY writes per symbol instead of
-    every single write (batch cleanup optimisation — Phase 3).
+    Batch-buffered: accumulates records and flushes via a single Redis
+    pipeline every BATCH_SIZE records or FLUSH_INTERVAL seconds.
     """
 
     TTL_1S = 7_200        # 2 hours for 1-second candles
     TTL_1M = 604_800      # 7 days for 1-minute candles
     CLEANUP_EVERY = 60    # run ZREMRANGEBYSCORE once every 60 writes / symbol
+    BATCH_SIZE = 50       # flush every N records
+    FLUSH_INTERVAL = 0.5  # flush every N seconds
 
     def open(self, runtime_context):
         self._r = redis.Redis(
@@ -164,12 +207,51 @@ class KeyDBKlineWriter(FlatMapFunction):
             socket_keepalive=True,
         )
         self._write_count: dict[str, int] = {}  # per-symbol counter
+        self._buffer: list[dict] = []
+        self._last_flush = time.time()
 
     def close(self):
         try:
+            self._flush()
             self._r.close()
         except Exception as e:
             log.error("[KeyDB/candles] close error: %s", e)
+
+    def _flush(self):
+        if not self._buffer:
+            return
+        try:
+            pipe = self._r.pipeline()
+            for item in self._buffer:
+                symbol = item["symbol"]
+                interval = item["interval"]
+                kline_start = item["kline_start"]
+                candle_json = item["candle_json"]
+                history_key = item["history_key"]
+                ttl_sec = item["ttl_sec"]
+
+                # Add to interval-specific sorted set
+                pipe.zadd(history_key, {candle_json: kline_start})
+
+                # Only update candle:latest for 1m+ (not raw 1s — we use ticker:latest)
+                if interval != "1s":
+                    pipe.hset(f"candle:latest:{symbol}", mapping=item["latest_mapping"])
+
+                # Batch cleanup: only ZREMRANGEBYSCORE every N writes per symbol
+                count = self._write_count.get(symbol, 0) + 1
+                self._write_count[symbol] = count
+                if count % self.CLEANUP_EVERY == 0:
+                    cutoff = kline_start - (ttl_sec * 1000)
+                    pipe.zremrangebyscore(history_key, 0, cutoff)
+                    pipe.expire(history_key, ttl_sec)
+
+            pipe.execute()
+        except Exception as e:
+            log.error("[KeyDB/candles] flush error (dropped %d records): %s",
+                      len(self._buffer), e)
+        finally:
+            self._buffer.clear()
+            self._last_flush = time.time()
 
     def flat_map(self, value):
         try:
@@ -200,35 +282,33 @@ class KeyDBKlineWriter(FlatMapFunction):
             else:  # 1m or other intervals
                 history_key = f"candle:1m:{symbol}"
                 ttl_sec = self.TTL_1M
-            
-            pipe = self._r.pipeline()
-            
-            # Update latest candle (no TTL)
-            pipe.hset(f"candle:latest:{symbol}", mapping={
-                "open":         float(value["open"]),
-                "high":         float(value["high"]),
-                "low":          float(value["low"]),
-                "close":        float(value["close"]),
-                "volume":       float(value["volume"]),
-                "quote_volume": float(value["quote_volume"]),
-                "trade_count":  int(value["trade_count"]),
-                "is_closed":    int(value["is_closed"]),
-                "kline_start":  kline_start,
-                "interval":     interval,
+
+            self._buffer.append({
+                "symbol": symbol,
+                "interval": interval,
+                "kline_start": kline_start,
+                "candle_json": candle_json,
+                "history_key": history_key,
+                "ttl_sec": ttl_sec,
+                "latest_mapping": {
+                    "open":         float(value["open"]),
+                    "high":         float(value["high"]),
+                    "low":          float(value["low"]),
+                    "close":        float(value["close"]),
+                    "volume":       float(value["volume"]),
+                    "quote_volume": float(value["quote_volume"]),
+                    "trade_count":  int(value["trade_count"]),
+                    "is_closed":    int(value["is_closed"]),
+                    "kline_start":  kline_start,
+                    "interval":     interval,
+                },
             })
-            
-            # Add to interval-specific sorted set
-            pipe.zadd(history_key, {candle_json: kline_start})
-            
-            # Batch cleanup: only ZREMRANGEBYSCORE every N writes per symbol
-            count = self._write_count.get(symbol, 0) + 1
-            self._write_count[symbol] = count
-            if count % self.CLEANUP_EVERY == 0:
-                cutoff = kline_start - (ttl_sec * 1000)
-                pipe.zremrangebyscore(history_key, 0, cutoff)
-                pipe.expire(history_key, ttl_sec)
-            
-            pipe.execute()
+
+            if (
+                len(self._buffer) >= self.BATCH_SIZE
+                or (time.time() - self._last_flush) >= self.FLUSH_INTERVAL
+            ):
+                self._flush()
         except Exception as e:
             s = value.get("symbol") if isinstance(value, dict) else "unknown"
             log.error("[KeyDB/candles] flat_map error | symbol=%s error=%s", s, e)
@@ -238,7 +318,7 @@ class KeyDBKlineWriter(FlatMapFunction):
 class InfluxDBKlineWriter(FlatMapFunction):
     """Writes kline candles from crypto_klines topic to InfluxDB `candles` measurement."""
 
-    def __init__(self, batch_size: int = 200, flush_interval_sec: float = 2.0):
+    def __init__(self, batch_size: int = 500, flush_interval_sec: float = 3.0):
         self.batch_size = batch_size
         self.flush_interval_sec = flush_interval_sec
 
@@ -600,7 +680,10 @@ class DepthWriter(FlatMapFunction):
     Receives partial order-book depth snapshots from crypto_depth topic.
     Writes to KeyDB:
         orderbook:{symbol}  (hash) — bids (JSON), asks (JSON), last_update_id, ts
+    Batch-buffered to reduce KeyDB round trips.
     """
+    BATCH_SIZE = 50
+    FLUSH_INTERVAL = 0.3
 
     def open(self, runtime_context):
         self._r = redis.Redis(
@@ -608,12 +691,44 @@ class DepthWriter(FlatMapFunction):
             decode_responses=True,
             socket_keepalive=True,
         )
+        self._buffer: list[dict] = []
+        self._last_flush = time.time()
 
     def close(self):
         try:
+            self._flush()
             self._r.close()
         except Exception as e:
             log.error("[Depth] close error: %s", e)
+
+    def _flush(self):
+        if not self._buffer:
+            return
+        try:
+            pipe = self._r.pipeline()
+            for rec in self._buffer:
+                symbol = rec["symbol"]
+                bids = rec["bids"]
+                asks = rec["asks"]
+                pipe.hset(f"orderbook:{symbol}", mapping={
+                    "bids":           json.dumps(bids),
+                    "asks":           json.dumps(asks),
+                    "last_update_id": rec["last_update_id"],
+                    "event_time":     rec["event_time"],
+                    "bid_depth":      len(bids),
+                    "ask_depth":      len(asks),
+                    "best_bid":       float(bids[0][0]) if bids else 0,
+                    "best_ask":       float(asks[0][0]) if asks else 0,
+                    "spread":         round(float(asks[0][0]) - float(bids[0][0]), 8) if bids and asks else 0,
+                })
+                pipe.expire(f"orderbook:{symbol}", 60)
+            pipe.execute()
+        except Exception as e:
+            log.error("[Depth] flush error (dropped %d records): %s",
+                      len(self._buffer), e)
+        finally:
+            self._buffer.clear()
+            self._last_flush = time.time()
 
     def flat_map(self, value):
         try:
@@ -624,25 +739,18 @@ class DepthWriter(FlatMapFunction):
             if not symbol:
                 return []
 
-            bids = value.get("bids", [])
-            asks = value.get("asks", [])
-
-            # Store compact representation in KeyDB hash
-            pipe = self._r.pipeline()
-            pipe.hset(f"orderbook:{symbol}", mapping={
-                "bids":           json.dumps(bids),
-                "asks":           json.dumps(asks),
+            self._buffer.append({
+                "symbol":         symbol,
+                "bids":           value.get("bids", []),
+                "asks":           value.get("asks", []),
                 "last_update_id": int(value.get("last_update_id", 0)),
                 "event_time":     int(value.get("event_time", 0)),
-                "bid_depth":      len(bids),
-                "ask_depth":      len(asks),
-                "best_bid":       float(bids[0][0]) if bids else 0,
-                "best_ask":       float(asks[0][0]) if asks else 0,
-                "spread":         round(float(asks[0][0]) - float(bids[0][0]), 8) if bids and asks else 0,
             })
-            pipe.expire(f"orderbook:{symbol}", 60)  # TTL 60s — refresh every 100ms
-            pipe.execute()
-
+            if (
+                len(self._buffer) >= self.BATCH_SIZE
+                or (time.time() - self._last_flush) >= self.FLUSH_INTERVAL
+            ):
+                self._flush()
         except Exception as e:
             s = value.get("symbol") if isinstance(value, dict) else "unknown"
             log.error("[Depth] flat_map error | symbol=%s error=%s", s, e)
@@ -668,12 +776,12 @@ def run():
     env.get_checkpoint_config().set_checkpoint_storage_dir(
         "file:///tmp/flink-checkpoints"
     )
-    env.enable_checkpointing(30_000)
+    env.enable_checkpointing(120_000)
     chk = env.get_checkpoint_config()
     chk.set_checkpointing_mode(CheckpointingMode.EXACTLY_ONCE)
     chk.enable_unaligned_checkpoints()
-    chk.set_min_pause_between_checkpoints(10_000)
-    chk.set_checkpoint_timeout(60_000)
+    chk.set_min_pause_between_checkpoints(30_000)
+    chk.set_checkpoint_timeout(120_000)
     t_env = StreamTableEnvironment.create(env)
 
     t_env.execute_sql(f"""
