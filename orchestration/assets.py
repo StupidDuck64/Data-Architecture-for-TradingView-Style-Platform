@@ -124,13 +124,6 @@ def iceberg_table_maintenance(context: AssetExecutionContext) -> None:
     )
 
 
-schedule_daily_klines = ScheduleDefinition(
-    name="daily_backfill_historical",
-    target=backfill_historical,
-    cron_schedule="0 2 * * *",
-    description="Runs daily at 02:00 AM to backfill InfluxDB gaps and ingest latest klines into Iceberg.",
-)
-
 schedule_weekly_maintenance = ScheduleDefinition(
     name="weekly_iceberg_maintenance",
     target=iceberg_table_maintenance,
@@ -152,7 +145,6 @@ defs = Definitions(
         iceberg_table_maintenance,
     ],
     schedules=[
-        schedule_daily_klines,
         schedule_weekly_maintenance,
         schedule_daily_aggregate,
     ],

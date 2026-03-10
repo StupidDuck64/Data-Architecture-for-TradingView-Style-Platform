@@ -200,13 +200,15 @@ Dagster tự chạy Chủ Nhật lúc 03:00 AM.
 
 ### `orchestration/assets.py` — Dagster Orchestration
 
-Định nghĩa 3 asset + 3 schedule:
+Định nghĩa 3 asset + 2 schedule:
 
-| Asset                       | Schedule           | Chức năng                                                          |
-| :-------------------------- | :----------------- | :----------------------------------------------------------------- |
-| `backfill_historical`       | 02:00 AM hàng ngày | Gọi `backfill_historical.py --mode all --iceberg-mode incremental` |
-| `aggregate_candles`         | 04:00 AM hàng ngày | Gọi `aggregate_candles.py --mode all`                              |
-| `iceberg_table_maintenance` | 03:00 AM Chủ Nhật  | Gọi `iceberg_maintenance.py`                                       |
+| Asset                       | Schedule           | Chức năng                                       |
+| :-------------------------- | :----------------- | :---------------------------------------------- |
+| `backfill_historical`       | **Chạy thủ công**  | Backfill InfluxDB gaps + Iceberg klines         |
+| `aggregate_candles`         | 04:00 AM hàng ngày | Gọi `aggregate_candles.py --mode all`           |
+| `iceberg_table_maintenance` | 03:00 AM Chủ Nhật  | Gọi `iceberg_maintenance.py`                    |
+
+> **Lưu ý:** `backfill_historical` **không có schedule tự động**. Chỉ chạy thủ công khi cần (xem phần "Lệnh backfill thủ công" ở trên).
 
 Tất cả chạy qua `spark-submit` trên Spark cluster.
 

@@ -56,6 +56,7 @@ const CandlestickChart = ({
 
   const [symbol, setSymbol] = useState(symbolProp || defaultSymbol);
   const [timeframe, setTimeframe] = useState("1m");
+  const [wsUnsub, setWsUnsub] = useState(null);
   const [tooltip, setTooltip] = useState(null);
   const [showIndPanel, setShowIndPanel] = useState(false);
   const [indSettings, setIndSettings] = useState(() =>
@@ -202,12 +203,15 @@ const CandlestickChart = ({
       const c = param.seriesData.get(cs);
       const v = param.seriesData.get(vs);
       if (c) {
+        // Hiển thị theo giờ Việt Nam
         const d = new Date(param.time * 1000);
-        const lbl = d.toLocaleString(undefined, {
+        const lbl = d.toLocaleString("vi-VN", {
+          timeZone: "Asia/Ho_Chi_Minh",
           month: "short",
           day: "2-digit",
           hour: "2-digit",
           minute: "2-digit",
+          second: "2-digit",
           hour12: false,
         });
         setTooltip({ ...c, volume: v ? v.value : null, timeLabel: lbl });
@@ -324,17 +328,63 @@ const CandlestickChart = ({
     };
 
     setIsLoading(true);
-    setNoData(false);
-    loadData();
-
-    // Full sync every 30 s (recalculates indicators)
-    const fullPollId = setInterval(loadData, 30000);
-    // Live tick every 1 s for candle agitation
-    const tickPollId = setInterval(tickUpdate, 1000);
-    return () => {
-      clearInterval(fullPollId);
-      clearInterval(tickPollId);
-    };
+    setFetchError(null);
+    // Nếu là 1s thì subscribe realtime
+    if (timeframe === "1s") {
+      fetchCandles(symbol, "1s", 120)
+        .then((data) => {
+          applyDataToChart(data);
+          setIsLoading(false);
+        })
+        .catch(() => {
+          setIsLoading(false);
+          setFetchError("Failed to load candle data");
+        });
+      // Đăng ký WebSocket cập nhật realtime
+      if (wsUnsub) wsUnsub();
+      const unsub = window.subscribeCandle
+        ? window.subscribeCandle(symbol, "1s", (candle) => {
+            setCandles((prev) => {
+              // Chỉ thêm nếu là candle mới
+              if (!prev.length || candle.time > prev[prev.length - 1].time) {
+                const next = [...prev.slice(-119), candle];
+                applyDataToChart(next);
+                return next;
+              }
+              return prev;
+            });
+          })
+        : require("../services/marketDataService").subscribeCandle(
+          symbol,
+          "1s",
+          (candle) => {
+            setCandles((prev) => {
+              if (!prev.length || candle.time > prev[prev.length - 1].time) {
+                const next = [...prev.slice(-119), candle];
+                applyDataToChart(next);
+                return next;
+              }
+              return prev;
+            });
+          }
+        );
+      setWsUnsub(() => unsub);
+      return () => {
+        if (unsub) unsub();
+      };
+    } else {
+      // Timeframe khác: fetch 1 lần
+      if (wsUnsub) wsUnsub();
+      fetchCandles(symbol, timeframe.toLowerCase(), 120)
+        .then((data) => {
+          applyDataToChart(data);
+          setIsLoading(false);
+        })
+        .catch(() => {
+          setIsLoading(false);
+          setFetchError("Failed to load candle data");
+        });
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, timeframe, historicalRange, retryCount]);
 
@@ -546,8 +596,8 @@ const CandlestickChart = ({
         <div className="flex items-center justify-between px-3 py-1.5 bg-amber-900/40 border-b border-amber-700/50">
           <span className="text-xs text-amber-300">
             Viewing historical data (Iceberg) &mdash;{" "}
-            {new Date(historicalRange.startMs).toLocaleString()} to{" "}
-            {new Date(historicalRange.endMs).toLocaleString()} (hourly candles)
+            {new Date(historicalRange.startMs).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })} to{" "}
+            {new Date(historicalRange.endMs).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })} (hourly candles)
           </span>
           <button
             onClick={() => setHistoricalRange(null)}

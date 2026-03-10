@@ -21,7 +21,7 @@ BINANCE_REST_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
 BINANCE_TICKER_WS_URL = "wss://stream.binance.com:9443/ws/!ticker@arr"
 BINANCE_COMBINED_WS_BASE = "wss://stream.binance.com:9443/stream"
 
-SYMBOLS_PER_CONNECTION = 200
+SYMBOLS_PER_CONNECTION = 50  # reduced from 200 to prevent ping/pong timeout
 TICKER_HEARTBEAT_INTERVAL = 5.0
 
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP", "kafka:9092")
@@ -35,7 +35,7 @@ DEPTH_UPDATE_MS    = os.environ.get("DEPTH_UPDATE_MS", "100")  # 100ms updates
 SCHEMA_REGISTRY_URL = os.environ.get(
     "SCHEMA_REGISTRY_URL", "http://schema-registry:8080/apis/ccompat/v7"
 )
-SYMBOLS_PER_DEPTH_CONN = 200  # same batch size as trades/klines
+SYMBOLS_PER_DEPTH_CONN = 50  # reduced from 200 to prevent ping/pong timeout
 MAX_SYMBOLS        = 400      # cap to avoid exceeding Binance WS connection limits
 
 producer: KafkaProducer | None = None
@@ -262,7 +262,7 @@ def run_ticker_stream() -> None:
                 ),
             )
             logging.info("[TICKER] Connecting to %s", BINANCE_TICKER_WS_URL)
-            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            ws.run_forever(ping_interval=40, ping_timeout=30, reconnect=0)
             delay = 5 + random.random() * 2
             logging.warning("[TICKER] Dropped. Reconnecting in %.1fs...", delay)
             time.sleep(delay)
@@ -329,7 +329,7 @@ def run_agg_trade_batch(stream_url: str, batch_idx: int) -> None:
                 ),
             )
             logging.info("[TRADES] Batch #%d connecting: %s", batch_idx, url_preview)
-            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            ws.run_forever(ping_interval=40, ping_timeout=30, reconnect=0)
             delay = 5 + random.random() * batch_idx
             logging.warning(
                 "[TRADES] Batch #%d dropped. Reconnecting in %.1fs...", batch_idx, delay
@@ -410,7 +410,7 @@ def run_kline_batch(stream_url: str, batch_idx: int) -> None:
                 ),
             )
             logging.info("[KLINES] Batch #%d connecting: %s", batch_idx, url_preview)
-            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            ws.run_forever(ping_interval=40, ping_timeout=30, reconnect=0)
             delay = 5 + random.random() * batch_idx
             logging.warning(
                 "[KLINES] Batch #%d dropped. Reconnecting in %.1fs...", batch_idx, delay
@@ -491,7 +491,7 @@ def run_depth_batch(stream_url: str, batch_idx: int) -> None:
                 ),
             )
             logging.info("[DEPTH] Batch #%d connecting: %s", batch_idx, url_preview)
-            ws.run_forever(ping_interval=20, ping_timeout=10, reconnect=0)
+            ws.run_forever(ping_interval=40, ping_timeout=30, reconnect=0)
             delay = 5 + random.random() * batch_idx
             logging.warning(
                 "[DEPTH] Batch #%d dropped. Reconnecting in %.1fs...", batch_idx, delay

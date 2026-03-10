@@ -2,21 +2,25 @@
 """
 backfill_historical.py
 ──────────────────────
-Unified backfill & historical import script.
-Gộp chức năng của backfill_influx.py + ingest_historical_iceberg.py.
+Unified backfill, populate & historical import script.
+Gộp chức năng của backfill_influx.py + ingest_historical_iceberg.py + initial_populate_influx.py.
 
 Mode:
   --mode influx       : Detect + fill InfluxDB gaps (tắt máy → mất data)
   --mode iceberg      : Pull historical 1h klines from Binance → Iceberg
-  --mode all          : Cả hai (mặc định)
+  --mode populate     : Force populate N ngày 1m candles cho tất cả symbols (lần đầu khởi động)
+  --mode all          : Chạy influx + iceberg (không bao gồm populate)
 
 Iceberg sub-modes:
   --iceberg-mode backfill     : Kéo từ 2017 → nay (chạy 1 lần đầu)
   --iceberg-mode incremental  : Chỉ kéo từ nến cuối đã lưu → nay (chạy hàng ngày)
 
 Ví dụ:
-  # Docker one-shot:
+  # Dagster scheduled:
   python backfill_historical.py --mode all --iceberg-mode incremental
+
+  # Lần đầu khởi động — populate 90 ngày cho 400 symbols:
+  python backfill_historical.py --mode populate --days 90
 
   # Chỉ fill gap InfluxDB:
   python backfill_historical.py --mode influx
@@ -333,6 +337,143 @@ def run_influx_backfill():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# INFLUXDB INITIAL POPULATE (Force pull N ngày cho tất cả symbols)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def klines_to_candles_points(symbol: str, klines: list[list]) -> list:
+    """
+    Convert Binance klines to InfluxDB Points (candles measurement - matches Flink output).
+    Schema: candles measurement with interval=1m tag.
+    """
+    from influxdb_client import Point, WritePrecision
+
+    points = []
+    for k in klines:
+        try:
+            open_ms     = int(k[0])
+            open_price  = float(k[1])
+            high        = float(k[2])
+            low         = float(k[3])
+            close_price = float(k[4])
+            volume      = float(k[5])
+            quote_vol   = float(k[7])
+            trades      = int(k[8])
+
+            point = (
+                Point("candles")
+                .tag("symbol",   symbol)
+                .tag("exchange", "binance")
+                .tag("interval", "1m")
+                .field("open",         open_price)
+                .field("high",         high)
+                .field("low",          low)
+                .field("close",        close_price)
+                .field("volume",       volume)
+                .field("quote_volume", quote_vol)
+                .field("trade_count",  trades)
+                .field("is_closed",    True)
+                .time(open_ms, WritePrecision.MS)
+            )
+            points.append(point)
+        except Exception as e:
+            log.warning("[%s] skip kline row: %s", symbol, e)
+    return points
+
+
+def populate_symbol(symbol: str, start_ms: int, end_ms: int, write_api) -> int:
+    """
+    Force pull historical 1m candles for 1 symbol and write to InfluxDB (candles measurement).
+    Không check gap, pull thẳng toàn bộ khoảng thời gian.
+    Returns number of points written.
+    """
+    days = (end_ms - start_ms) / 1000 / 86400
+    log.info(
+        "[%s] Populate %.1f days (%s → %s)",
+        symbol, days,
+        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d"),
+        datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%m-%d"),
+    )
+
+    klines = fetch_klines(symbol, start_ms, end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
+    if not klines:
+        log.warning("[%s] No klines returned.", symbol)
+        return 0
+
+    log.info("[%s] Fetched %d candles, converting...", symbol, len(klines))
+    points = klines_to_candles_points(symbol, klines)
+
+    if not points:
+        return 0
+
+    try:
+        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
+        log.info("[%s] ✓ Written %d points to InfluxDB", symbol, len(points))
+        return len(points)
+    except Exception as e:
+        log.error("[%s] Write error: %s", symbol, e)
+        return 0
+
+
+def run_initial_populate(days: int = 90, symbols_list: list[str] | None = None):
+    """
+    Entry point cho initial populate mode.
+    Kéo N ngày 1m candles cho tất cả USDT symbols (hoặc danh sách cụ thể).
+    """
+    from influxdb_client import InfluxDBClient
+    from influxdb_client.client.write_api import SYNCHRONOUS
+
+    log.info("=== InfluxDB Initial Populate ===")
+    log.info("Days: %d", days)
+
+    # Fetch all 400 USDT symbols from Binance (matching producer)
+    symbols = symbols_list or fetch_usdt_symbols()[:400]  # Cap at 400 like producer
+    log.info("Symbols: %d (all active USDT pairs)", len(symbols))
+
+    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - (days * 24 * 3600 * 1000)
+
+    log.info(
+        "Time range: %s → %s",
+        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+        datetime.fromtimestamp(end_ms   / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+    )
+    log.info(
+        "⚠️  This will take ~2-3 hours for 400 symbols × 90 days (~52M candles)."
+    )
+
+    # Connect InfluxDB
+    client    = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+    wait_for_influx(client)
+
+    # Populate in parallel
+    total_points  = 0
+    total_success = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(populate_symbol, sym, start_ms, end_ms, write_api): sym
+            for sym in symbols
+        }
+
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                n = future.result()
+                if n > 0:
+                    total_points += n
+                    total_success += 1
+            except Exception as e:
+                log.error("[%s] Unexpected error: %s", sym, e)
+
+    log.info(
+        "Initial populate complete — %d/%d symbols, %d total points written.",
+        total_success, len(symbols), total_points,
+    )
+    client.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ICEBERG HISTORICAL IMPORT (Spark)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -564,12 +705,17 @@ def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified backfill (InfluxDB gap fill) + historical import (Iceberg).",
+        description="Unified backfill (gap fill) + populate (initial) + historical import (Iceberg).",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "--mode", choices=["influx", "iceberg", "all"], default="all",
-        help="influx  = fill InfluxDB gaps\niceberg = historical klines → Iceberg\nall     = cả hai (default)",
+        "--mode", choices=["influx", "iceberg", "populate", "all"], default="all",
+        help=(
+            "influx   = fill InfluxDB gaps\n"
+            "iceberg  = historical klines → Iceberg\n"
+            "populate = force pull N days for all symbols (lần đầu khởi động)\n"
+            "all      = influx + iceberg (default, không bao gồm populate)"
+        ),
     )
     parser.add_argument(
         "--iceberg-mode", choices=["backfill", "incremental"], default="incremental",
@@ -579,9 +725,21 @@ def main():
         "--symbols", nargs="*", default=None,
         help="Danh sách symbols cụ thể (VD: BTCUSDT ETHUSDT). Mặc định: tất cả USDT pairs.",
     )
+    parser.add_argument(
+        "--days", type=int, default=90,
+        help="Số ngày lịch sử muốn pull cho mode populate (default: 90 = 3 tháng)",
+    )
     args = parser.parse_args()
 
-    log.info("=== Backfill & Historical Import | mode=%s ===", args.mode)
+    log.info("=== Backfill, Populate & Historical Import | mode=%s ===", args.mode)
+
+    if args.mode == "populate":
+        # Initial populate mode — force pull N days for all symbols
+        try:
+            run_initial_populate(days=args.days, symbols_list=args.symbols)
+        except Exception as e:
+            log.error("Initial populate failed: %s", e)
+        return
 
     if args.mode in ("influx", "all"):
         try:
