@@ -11,8 +11,8 @@ import { Settings, Download } from "lucide-react";
 import { useI18n } from "../i18n";
 import {
   fetchCandles,
-  fetchTicker,
   fetchHistoricalCandles,
+  subscribeCandle,
 } from "../services/marketDataService";
 import MarketSelector from "./MarketSelector";
 import DateRangePicker from "./DateRangePicker";
@@ -56,7 +56,6 @@ const CandlestickChart = ({
 
   const [symbol, setSymbol] = useState(symbolProp || defaultSymbol);
   const [timeframe, setTimeframe] = useState("1m");
-  const [wsUnsub, setWsUnsub] = useState(null);
   const [tooltip, setTooltip] = useState(null);
   const [showIndPanel, setShowIndPanel] = useState(false);
   const [indSettings, setIndSettings] = useState(() =>
@@ -203,17 +202,7 @@ const CandlestickChart = ({
       const c = param.seriesData.get(cs);
       const v = param.seriesData.get(vs);
       if (c) {
-        // Hiển thị theo giờ Việt Nam
-        const d = new Date(param.time * 1000);
-        const lbl = d.toLocaleString("vi-VN", {
-          timeZone: "Asia/Ho_Chi_Minh",
-          month: "short",
-          day: "2-digit",
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-          hour12: false,
-        });
+        const lbl = localTimeFormatter(param.time);
         setTooltip({ ...c, volume: v ? v.value : null, timeLabel: lbl });
       }
     });
@@ -271,120 +260,121 @@ const CandlestickChart = ({
   // Load data when symbol or timeframe changes (live mode) + auto-refresh
   useEffect(() => {
     if (!candleRef.current || historicalRange) return;
+    let cancelled = false;
+    const is1s = timeframe === "1s";
 
     // Update secondsVisible based on timeframe
     if (chartRef.current) {
-      const showSeconds = timeframe === "1s" || timeframe === "1m";
+      const showSeconds = is1s || timeframe === "1m";
       chartRef.current
         .timeScale()
         .applyOptions({ secondsVisible: showSeconds });
     }
 
-    // Full load — fetches 200 candles, rebuilds all series + indicators
+    const limit = is1s ? 120 : 200;
+    const maxBars = is1s ? 120 : 500;
+
+    // Full load — fetches candles, rebuilds all series + indicators
     const loadData = () => {
       setFetchError(null);
-      fetchCandles(symbol, timeframe.toLowerCase(), 200)
+      return fetchCandles(symbol, timeframe.toLowerCase(), limit)
         .then((data) => {
+          if (cancelled) return;
           applyDataToChart(data);
           setIsLoading(false);
         })
         .catch(() => {
+          if (cancelled) return;
           setIsLoading(false);
           setFetchError("Failed to load candle data");
         });
-    };
-
-    // Lightweight tick — fetches live ticker price and patches the last
-    // candle's close/high/low so it visually "agitates" in real time.
-    const tickUpdate = () => {
-      fetchTicker(symbol)
-        .then((ticker) => {
-          if (!ticker || !candleRef.current) return;
-          const prev = candlesRef.current;
-          if (prev.length === 0) return;
-          const price = ticker.price;
-          const last = { ...prev[prev.length - 1] };
-          last.close = price;
-          last.high = Math.max(last.high, price);
-          last.low = Math.min(last.low, price);
-          candleRef.current.update(last);
-          if (volumeRef.current) {
-            volumeRef.current.update({
-              time: last.time,
-              value: last.volume,
-              color: price >= last.open ? THEME.volumeUp : THEME.volumeDown,
-            });
-          }
-          const next = [...prev];
-          next[next.length - 1] = last;
-          candlesRef.current = next;
-          setCandles(next);
-          if (onCandlesChange) onCandlesChange(next);
-          setTooltip((tip) =>
-            tip ? { ...tip, ...last, timeLabel: tip.timeLabel } : null,
-          );
-        })
-        .catch(() => {}); // silent — full refresh will recover
     };
 
     setIsLoading(true);
     setFetchError(null);
-    // Nếu là 1s thì subscribe realtime
-    if (timeframe === "1s") {
-      fetchCandles(symbol, "1s", 120)
-        .then((data) => {
-          applyDataToChart(data);
-          setIsLoading(false);
-        })
-        .catch(() => {
-          setIsLoading(false);
-          setFetchError("Failed to load candle data");
-        });
-      // Đăng ký WebSocket cập nhật realtime
-      if (wsUnsub) wsUnsub();
-      const unsub = window.subscribeCandle
-        ? window.subscribeCandle(symbol, "1s", (candle) => {
-            setCandles((prev) => {
-              // Chỉ thêm nếu là candle mới
-              if (!prev.length || candle.time > prev[prev.length - 1].time) {
-                const next = [...prev.slice(-119), candle];
-                applyDataToChart(next);
-                return next;
-              }
-              return prev;
-            });
-          })
-        : require("../services/marketDataService").subscribeCandle(
-          symbol,
-          "1s",
-          (candle) => {
-            setCandles((prev) => {
-              if (!prev.length || candle.time > prev[prev.length - 1].time) {
-                const next = [...prev.slice(-119), candle];
-                applyDataToChart(next);
-                return next;
-              }
-              return prev;
+    setNoData(false);
+    loadData();
+
+    // Subscribe to real-time candle updates via WebSocket.
+    //
+    // 1s  : Every WS message with a new timestamp draws a brand-new candle.
+    //        Same-second repeats are ignored (candle is already drawn).
+    //
+    // 1m+ : Same openTime → update (agitate) the latest bar in real-time.
+    //        New openTime  → finalize previous bar, start a new one.
+    const unsub = subscribeCandle(
+      symbol,
+      timeframe.toLowerCase(),
+      (candle) => {
+        if (cancelled || !candleRef.current) return;
+        const prev = candlesRef.current;
+        if (prev.length === 0) return;
+
+        const lastTime = prev[prev.length - 1].time;
+
+        if (is1s) {
+          // ── 1-second mode: only draw new candles, never update old ones ──
+          if (candle.time <= lastTime) return; // same or stale second → skip
+          candleRef.current.update(candle);
+          if (volumeRef.current) {
+            volumeRef.current.update({
+              time: candle.time,
+              value: candle.volume,
+              color:
+                candle.close >= candle.open
+                  ? THEME.volumeUp
+                  : THEME.volumeDown,
             });
           }
-        );
-      setWsUnsub(() => unsub);
-      return () => {
-        if (unsub) unsub();
-      };
-    } else {
-      // Timeframe khác: fetch 1 lần
-      if (wsUnsub) wsUnsub();
-      fetchCandles(symbol, timeframe.toLowerCase(), 120)
-        .then((data) => {
-          applyDataToChart(data);
-          setIsLoading(false);
-        })
-        .catch(() => {
-          setIsLoading(false);
-          setFetchError("Failed to load candle data");
-        });
-    }
+          const next = [...prev.slice(-(maxBars - 1)), candle];
+          candlesRef.current = next;
+          setCandles(next);
+          if (onCandlesChange) onCandlesChange(next);
+          setTooltip((tip) =>
+            tip ? { ...tip, ...candle, timeLabel: tip.timeLabel } : null,
+          );
+        } else {
+          // ── Other timeframes: agitate latest bar, append on new period ──
+          if (candle.time < lastTime) return; // stale → skip
+          candleRef.current.update(candle);
+          if (volumeRef.current) {
+            volumeRef.current.update({
+              time: candle.time,
+              value: candle.volume,
+              color:
+                candle.close >= candle.open
+                  ? THEME.volumeUp
+                  : THEME.volumeDown,
+            });
+          }
+          let next;
+          if (candle.time === lastTime) {
+            // Same period → replace last element
+            next = [...prev];
+            next[next.length - 1] = candle;
+          } else {
+            // New period → append
+            next = [...prev.slice(-(maxBars - 1)), candle];
+          }
+          candlesRef.current = next;
+          setCandles(next);
+          if (onCandlesChange) onCandlesChange(next);
+          setTooltip((tip) =>
+            tip ? { ...tip, ...candle, timeLabel: tip.timeLabel } : null,
+          );
+        }
+      },
+    );
+
+    // For 1m+ re-fetch every 30s so indicators stay in sync.
+    // For 1s skip the full poll — the WS stream is the source of truth.
+    const fullPollId = is1s ? null : setInterval(loadData, 30000);
+
+    return () => {
+      cancelled = true;
+      if (fullPollId) clearInterval(fullPollId);
+      if (unsub) unsub();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, timeframe, historicalRange, retryCount]);
 
@@ -595,9 +585,9 @@ const CandlestickChart = ({
       {historicalRange && (
         <div className="flex items-center justify-between px-3 py-1.5 bg-amber-900/40 border-b border-amber-700/50">
           <span className="text-xs text-amber-300">
-            Viewing historical data (Iceberg) &mdash;{" "}
-            {new Date(historicalRange.startMs).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })} to{" "}
-            {new Date(historicalRange.endMs).toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" })} (hourly candles)
+            Viewing historical data &mdash;{" "}
+            {new Date(historicalRange.startMs).toLocaleString()} to{" "}
+            {new Date(historicalRange.endMs).toLocaleString()} (hourly candles)
           </span>
           <button
             onClick={() => setHistoricalRange(null)}

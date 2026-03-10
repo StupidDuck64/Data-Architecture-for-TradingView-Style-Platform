@@ -112,6 +112,7 @@ async def get_klines(
     # Fallback: if requesting >=1h data but no aggregated 1h rows exist yet,
     # re-query InfluxDB for 1m data and aggregate server-side.
     if not candles and base == "1h":
+        base = "1m"
         mult = max(target_sec // 60, 1)
         needed = limit * mult + mult
         range_h = min(max(needed // 60 + 1, 1), 168)  # 7 days max for 1m
@@ -122,9 +123,13 @@ async def get_klines(
     # Fallback: try KeyDB candle sorted sets
     if not candles:
         r = await get_redis()
-        # Try 1m first, then 1s
+        # Try the resolution that matches the requested interval first
+        if interval == "1s":
+            key_order = (f"candle:1s:{symbol}", f"candle:1m:{symbol}")
+        else:
+            key_order = (f"candle:1m:{symbol}", f"candle:1s:{symbol}")
         raw = None
-        for keydb_key in (f"candle:1m:{symbol}", f"candle:1s:{symbol}"):
+        for keydb_key in key_order:
             raw = await r.zrangebyscore(keydb_key, "-inf", "+inf")
             if raw:
                 break
@@ -146,26 +151,28 @@ async def get_klines(
     if base != interval and candles:
         candles = _aggregate(candles, target_sec * 1000)
 
-    # Merge the live in-progress candle from KeyDB so the latest bar
-    # reflects real-time price changes (agitation) between interval boundaries.
+    # Merge the live in-progress candle using the real-time ticker price
+    # so the latest bar reflects current price even when Flink lags.
     r = await get_redis()
-    live = await r.hgetall(f"candle:latest:{symbol}")
-    if live:
+    ticker = await r.hgetall(f"ticker:latest:{symbol}")
+    if ticker.get("price") and ticker.get("event_time"):
         target_ms = target_sec * 1000
-        kline_start = int(live["kline_start"])
-        aligned_time = (kline_start // target_ms) * target_ms
-        live_candle = {
-            "openTime": aligned_time,
-            "open": float(live["open"]),
-            "high": float(live["high"]),
-            "low": float(live["low"]),
-            "close": float(live["close"]),
-            "volume": float(live["volume"]),
-        }
+        live_price = float(ticker["price"])
+        live_ts = int(ticker["event_time"])
+        aligned_time = (live_ts // target_ms) * target_ms
         if candles and candles[-1]["openTime"] == aligned_time:
-            # Same period — replace with the live version (has latest OHLCV)
-            candles[-1] = live_candle
+            # Same period — update close / extend high-low with live price
+            candles[-1]["close"] = live_price
+            candles[-1]["high"] = max(candles[-1]["high"], live_price)
+            candles[-1]["low"] = min(candles[-1]["low"], live_price)
         elif not candles or aligned_time > candles[-1]["openTime"]:
-            candles.append(live_candle)
+            candles.append({
+                "openTime": aligned_time,
+                "open": live_price,
+                "high": live_price,
+                "low": live_price,
+                "close": live_price,
+                "volume": 0,
+            })
 
     return candles[-limit:]
