@@ -1,741 +1,1233 @@
-# Tài liệu Kỹ thuật — CryptoPrice Platform
+﻿# Tài liệu Kỹ thuật — Lambda Architecture Crypto Platform
 
-## Nền tảng Theo dõi Giá Tiền điện tử Real-time
+> **Mục tiêu tài liệu:** Giải thích sâu toàn bộ hệ thống từ luồng dữ liệu, kiến trúc, từng service, đến logic xử lý trong code — để bạn hiểu được "cái gì làm gì và tại sao".
 
 ---
 
 ## Mục lục
 
 1. [Tổng quan dự án](#1-tổng-quan-dự-án)
-2. [Kiến trúc Lambda](#2-kiến-trúc-lambda)
-3. [Công nghệ sử dụng](#3-công-nghệ-sử-dụng)
-4. [Cấu trúc thư mục](#4-cấu-trúc-thư-mục)
-5. [Các loại dữ liệu & Schema](#5-các-loại-dữ-liệu--schema)
-6. [Luồng dữ liệu End-to-End](#6-luồng-dữ-liệu-end-to-end)
-7. [Chi tiết từng Component](#7-chi-tiết-từng-component)
-8. [API Endpoints](#8-api-endpoints)
-9. [Hướng dẫn triển khai](#9-hướng-dẫn-triển-khai)
-10. [Xử lý sự cố](#10-xử-lý-sự-cố)
+2. [Kiến trúc Lambda — Tổng thể](#2-kiến-trúc-lambda--tổng-thể)
+3. [Luồng dữ liệu đầy đủ](#3-luồng-dữ-liệu-đầy-đủ)
+4. [Lớp Data (Data Layer)](#4-lớp-data-data-layer)
+5. [Lớp Compute (Processing Layer)](#5-lớp-compute-processing-layer)
+6. [Lớp Query & Orchestration](#6-lớp-query--orchestration)
+7. [Lớp Serving (FastAPI)](#7-lớp-serving-fastapi)
+8. [Lớp Frontend (React)](#8-lớp-frontend-react)
+9. [Chi tiết từng file source code](#9-chi-tiết-từng-file-source-code)
+10. [Kafka topics và Avro schemas](#10-kafka-topics-và-avro-schemas)
+11. [KeyDB — cấu trúc key và TTL](#11-keydb--cấu-trúc-key-và-ttl)
+12. [InfluxDB — measurement và retention](#12-influxdb--measurement-và-retention)
+13. [Iceberg / MinIO — cold storage](#13-iceberg--minio--cold-storage)
+14. [Dagster — Orchestration & Scheduling](#14-dagster--orchestration--scheduling)
+15. [Startup & Vận hành](#15-startup--vận-hành)
+16. [Các vấn đề đã gặp và cách sửa](#16-các-vấn-đề-đã-gặp-và-cách-sửa)
 
 ---
 
 ## 1. Tổng quan dự án
 
-### Mục đích
+**Lambda Architecture for TradingView-Style Platform** là một hệ thống real-time xử lý và hiển thị giá tiền điện tử, hoạt động hoàn toàn trên Docker (18 container). Hệ thống theo dõi ~400 cặp USDT Spot từ Binance, xử lý dữ liệu theo kiến trúc Lambda gồm 3 lớp: **Speed layer** (Flink), **Batch layer** (Spark), **Serving layer** (FastAPI + KeyDB), và hiển thị qua dashboard TradingView-style (React + lightweight-charts).
 
-CryptoPrice là nền tảng theo dõi giá tiền điện tử real-time, được thiết kế theo mô hình TradingView. Hệ thống thu thập dữ liệu trực tiếp từ Binance, xử lý qua 2 luồng (real-time và batch), lưu trữ trên nhiều database chuyên dụng, và phục vụ qua giao diện React.
+**Tech stack:**
 
-### Chức năng chính
-
-| Chức năng | Mô tả |
-|-----------|-------|
-| **Theo dõi real-time** | 400+ cặp giao dịch USDT, độ trễ ~500ms |
-| **Biểu đồ nến** | 8 timeframe: 1s, 1m, 5m, 15m, 1H, 4H, 1D, 1W |
-| **Scroll historical** | Kéo trái để load thêm dữ liệu lịch sử vô hạn |
-| **Order Book** | Sổ lệnh top 20 cập nhật mỗi 100ms |
-| **Indicators** | SMA20, SMA50, EMA12, EMA26, RSI, MFI |
-| **Watchlist** | Danh sách theo dõi, đánh dấu yêu thích |
-| **Backfill tự động** | Tự động bù đắp dữ liệu khi hệ thống downtime |
-
-### Nguyên tắc Lambda Architecture
-
-| Layer | Công nghệ | Vai trò |
-|-------|-----------|---------|
-| **Speed Layer** | Flink → KeyDB + InfluxDB | Xử lý real-time, độ trễ thấp |
-| **Batch Layer** | Spark → Iceberg/MinIO | Xử lý lịch sử, aggregation |
-| **Serving Layer** | FastAPI + Nginx + React | Phục vụ API và giao diện |
+| Thành phần | Công nghệ | Phiên bản |
+|---|---|---|
+| Message broker | Apache Kafka (KRaft mode) | 3.9.0 |
+| Schema registry | Apicurio (Confluent-compatible) | 2.6.2 |
+| Stream processing | Apache Flink | 1.18.1 |
+| Batch processing | Apache Spark | 3.5 |
+| Hot cache | KeyDB (Redis-compatible) | latest |
+| Time-series DB | InfluxDB | 2.7 |
+| Cold storage | Apache Iceberg + MinIO | 1.5.2 + latest |
+| Federated query | Trino | 442 |
+| Orchestration | Dagster | latest |
+| API server | FastAPI + Uvicorn | 0.115+ |
+| Frontend | React 18 + lightweight-charts | v5.1.0 |
+| Reverse proxy | Nginx | 1.27 |
+| Metadata DB | PostgreSQL | 16 |
 
 ---
 
-## 2. Kiến trúc Lambda
+## 2. Kiến trúc Lambda — Tổng thể
 
-### Sơ đồ tổng quan
+Kiến trúc Lambda chia dữ liệu xử lý thành 3 đường song song:
 
 ```
-BINANCE EXCHANGE
-    │
-    │ WebSocket (wss://)
-    │  ├─ !ticker@arr (ticker 24h)
-    │  ├─ <symbol>@kline_1s (nến 1 giây)
-    │  └─ <symbol>@depth20@100ms (order book)
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  DOCKER COMPOSE (18 containers)                             │
-│                                                             │
-│  ┌─────────────┐     ┌─────────────┐                        │
-│  │  Producer   │────▶│   KAFKA     │                        │
-│  │ (Python WS) │     │  (3 topics) │                        │
-│  └─────────────┘     └──────┬──────┘                        │
-│                             │                               │
-│              ┌──────────────┴──────────────┐                │
-│              │      FLINK CLUSTER          │                │
-│              │  (Speed Layer - Real-time)  │                │
-│              └──────┬───────────┬──────────┘                │
-│                     │           │                           │
-│         ┌──────────┴┐     ┌────┴────────┐                   │
-│         ▼           ▼     ▼             ▼                   │
-│   ┌──────────┐ ┌──────────┐ ┌─────────────────┐             │
-│   │  KeyDB   │ │ InfluxDB │ │ ICEBERG/MinIO   │             │
-│   │(hot cache)│ │(time-ser)│ │  (data lake)    │             │
-│   └────┬─────┘ └────┬─────┘ └───────┬─────────┘             │
-│        │            │               │                       │
-│        │      ┌─────┴─────┐   ┌─────┴─────┐                 │
-│        │      │  SPARK    │   │   TRINO   │                 │
-│        │      │  (Batch)  │   │ (SQL qry) │                 │
-│        │      └───────────┘   └─────┬─────┘                 │
-│        │                            │                       │
-│   ┌────┴────────────────────────────┴─────┐                 │
-│   │            FASTAPI                     │                 │
-│   │        (REST + WebSocket)             │                 │
-│   └────────────────┬──────────────────────┘                 │
-│                    │                                        │
-│   ┌────────────────┴──────────────────────┐                 │
-│   │  NGINX + REACT (Frontend Dashboard)   │                 │
-│   └───────────────────────────────────────┘                 │
-└─────────────────────────────────────────────────────────────┘
+                         ┌─────────────────────────────────────────────────────────┐
+                         │                 BINANCE WebSocket API                   │
+                         │   !ticker@arr  |  @kline_1s  |  @aggTrade  |  @depth   │
+                         └──────────────────────────┬──────────────────────────────┘
+                                                    │
+                                            [producer_binance.py]
+                                         Avro serialize → Kafka
+                                                    │
+               ┌────────────────────────────────────┼──────────────────────────────────┐
+               │                                    │                                  │
+        crypto_ticker                         crypto_klines                   crypto_depth
+        crypto_trades                                │                         crypto_trades
+               │                                    │                                  │
+               │                          ┌─────────▼──────────┐                      │
+               │                          │   Apache Flink      │                      │
+               │                          │  (Speed Layer)      │◄─────────────────────┘
+               │                          │                      │
+               │                          │ KlineWindowAggregator│
+               │                          │  1s → 1m aggregation │
+               │                          │                      │
+               │                          │ KeyDBKlineWriter     │
+               │                          │  candle:1s, candle:1m│
+               │                          │                      │
+               │                          │ InfluxDBKlineWriter  │
+               │                          │  candles measurement │
+               │                          │                      │
+               │                          │ IndicatorWriter      │
+               │                          │  SMA20/50, EMA12/26  │
+               │                          └──────────────────────┘
+               │
+               │  [Batch Layer — chạy qua Dagster schedule]
+               │
+               ▼
+        [backfill_historical.py]           [aggregate_candles.py]
+         Binance REST → Iceberg             1m → 1h aggregation
+         historical_hourly table            coin_klines_hourly table
+               │
+               ▼
+         ┌────────────┐    ┌──────────┐    ┌──────────┐
+         │  KeyDB     │    │ InfluxDB │    │  Iceberg │
+         │ (hot cache)│    │ (warm)   │    │ (cold)   │
+         └─────┬──────┘    └────┬─────┘    └────┬─────┘
+               │               │                │
+               └───────────────┴────────────────┘
+                                       │
+                               [FastAPI Serving Layer]
+                               /api/klines, /api/stream (WS)
+                               /api/ticker, /api/orderbook
+                               /api/klines/historical (Trino)
+                                       │
+                               [Nginx reverse proxy]
+                                       │
+                               [React Frontend]
+                               CandlestickChart (lightweight-charts)
+                               OrderBook, RecentTrades, Watchlist
 ```
 
-### Vai trò từng layer
+**Tại sao Lambda Architecture?**
 
-| Layer | Component | Chức năng |
-|-------|-----------|-----------|
-| **Ingestion** | `producer_binance.py` | Thu thập WebSocket Binance → Kafka |
-| **Speed** | Flink + `ingest_flink_crypto.py` | Xử lý real-time → KeyDB, InfluxDB |
-| **Batch** | Spark + các script Python | Backfill, aggregation 1m→1h, maintenance |
-| **Storage** | KeyDB, InfluxDB, Iceberg/MinIO, PostgreSQL | Hot cache, time-series, data lake, metadata |
-| **Query** | Trino | SQL queries trên Iceberg tables |
-| **Orchestration** | Dagster | Lập lịch và giám sát batch jobs |
-| **Serving** | FastAPI + Nginx + React | REST/WebSocket API + giao diện web |
+- **Speed layer** (Flink): Xử lý real-time với độ trễ < 2s, lưu vào KeyDB + InfluxDB
+- **Batch layer** (Spark): Xử lý lại chính xác dữ liệu lịch sử, lưu vào Iceberg (MinIO)
+- **Serving layer** (FastAPI): Merge 2 nguồn theo độ ưu tiên: KeyDB → InfluxDB → Trino/Iceberg
 
 ---
 
-## 3. Công nghệ sử dụng
+## 3. Luồng dữ liệu đầy đủ
 
-### Messaging & Storage
-
-| Công nghệ | Version | Vai trò | Port |
-|-----------|---------|---------|------|
-| **Apache Kafka** | 3.9.0 (KRaft) | Message broker, event streaming | 9092 |
-| **MinIO** | Latest | Object storage S3-compatible (Iceberg warehouse) | 9000, 9001 |
-| **InfluxDB** | 2.7 | Time-series database | 8086 |
-| **PostgreSQL** | 16-alpine | Metadata (Iceberg catalog + Dagster) | 5432 |
-| **KeyDB** | Latest | In-memory cache Redis-compatible | 6379 |
-
-### Processing
-
-| Công nghệ | Version | Vai trò | Port |
-|-----------|---------|---------|------|
-| **Apache Flink** | 1.18.1 | Stream processing (speed layer) | 8081 |
-| **Apache Spark** | 3.5.5 | Batch processing | 7077, 8082, 18080 |
-| **Apache Iceberg** | 1.5.2 | Table format cho data lake (ACID) | — |
-| **Trino** | 442 | SQL query engine trên Iceberg | 8083 |
-| **Dagster** | 1.8.x | Workflow orchestration | 3000 |
-
-### Serving
-
-| Công nghệ | Version | Vai trò | Port |
-|-----------|---------|---------|------|
-| **FastAPI** | 0.115+ | REST + WebSocket API | 8000 (internal) |
-| **Nginx** | 1.25 | Reverse proxy, static files | 80 |
-| **React** | 18.3.1 | Frontend SPA | — (qua Nginx) |
-
-### Frontend Libraries
-
-| Package | Version | Mục đích |
-|---------|---------|----------|
-| `lightweight-charts` | 5.1.0 | Biểu đồ nến TradingView-style |
-| `recharts` | 2.12.7 | Charting bổ sung |
-| `lucide-react` | 0.396.0 | Icon library |
-| `tailwindcss` | 3.4.4 | CSS framework |
-
----
-
-## 4. Cấu trúc thư mục
+### 3.1 Real-time path (< 2s latency)
 
 ```
-cryptoprice_local/
-│
-├── docker-compose.yml          # Định nghĩa 18 services
-├── .env                        # Biến môi trường (tokens, passwords)
-├── .env.example                # Template biến môi trường
-│
-├── config/                     # Cấu hình
-│   └── spark-defaults.conf     # Spark driver/executor + Iceberg
-│
-├── docs/                       # Tài liệu
-│   ├── README.md               # Hướng dẫn nhanh
-│   ├── DOCUMENTATION.md        # Tài liệu kỹ thuật (file này)
-│   └── SYSTEM_ARCHITECTURE.md  # Kiến trúc chi tiết
-│
-├── scripts/                    # Scripts tiện ích
-│   ├── auto_submit_jobs.sh     # Tự động submit Flink jobs
-│   ├── setup_influx_retention.ps1  # Thiết lập retention InfluxDB (Windows)
-│   └── setup_influx_retention.sh   # Thiết lập retention InfluxDB (Linux)
-│
-├── docker/                     # Dockerfiles & configs
-│   ├── backfill/               # InfluxDB gap-filling
-│   ├── dagster/                # Dagster + Spark base
-│   ├── fastapi/                # FastAPI + uvicorn
-│   ├── flink/                  # Flink + Python + Kafka connector
-│   ├── nginx/                  # React build + Nginx
-│   ├── postgres/               # Init script (databases)
-│   ├── producer/               # Binance WebSocket producer
-│   ├── spark/                  # Spark master/worker
-│   └── trino/                  # Trino coordinator config
-│
-├── orchestration/              # Dagster definitions
-│   ├── assets.py               # 3 Spark job assets + cron schedules
-│   └── workspace.yaml          # Dagster workspace config
-│
-├── schemas/                    # Avro schemas cho Kafka
-│   ├── ticker.avsc             # Ticker 24h data
-│   ├── kline.avsc              # Candlestick/Kline data
-│   ├── trade.avsc              # Trade data
-│   └── depth.avsc              # Order book depth
-│
-├── serving/                    # FastAPI backend
-│   ├── main.py                 # App entry point
-│   ├── config.py               # Environment config
-│   ├── connections.py          # Redis, InfluxDB, Trino connections
-│   └── routers/                # API endpoints
-│       ├── klines.py           # Candle queries
-│       ├── historical.py       # Historical data (Trino)
-│       ├── ticker.py           # Live ticker
-│       ├── orderbook.py        # Order book
-│       ├── trades.py           # Recent trades
-│       ├── symbols.py          # Symbol list
-│       ├── indicators.py       # SMA/EMA indicators
-│       └── ws.py               # WebSocket streaming
-│
-├── src/                        # Python source code
-│   ├── producer_binance.py     # Binance WS → Kafka
-│   ├── ingest_flink_crypto.py  # Flink: Kafka → KeyDB + InfluxDB
-│   ├── ingest_crypto.py        # Spark: Kafka → Iceberg
-│   ├── backfill_historical.py  # Backfill InfluxDB + Iceberg
-│   ├── aggregate_candles.py    # 1m → 1h aggregation
-│   ├── iceberg_maintenance.py  # Table maintenance
-│   └── candle_query_helper.py  # Query helper
-│
-└── frontend/                   # React SPA
-    ├── package.json            # Dependencies
-    ├── tailwind.config.js      # TailwindCSS config
-    └── src/
-        ├── App.js              # Main layout
-        ├── components/         # React components
-        │   ├── CandlestickChart.js
-        │   ├── Watchlist.js
-        │   ├── OrderBook.js
-        │   └── ...
-        ├── services/           # API abstraction
-        ├── hooks/              # Custom hooks
-        └── i18n/               # Internationalization
+Binance WS (!ticker@arr, batch mỗi 14-30s)
+  → producer_binance.py → Avro serialize
+  → Kafka topic: crypto_ticker
+  → Flink: KeyDBWriter / InfluxDBWriter
+  → KeyDB: ticker:latest:{symbol} (hash)
+  → InfluxDB: market_ticks measurement
+
+Binance WS (@kline_1s mỗi symbol, 1 message/giây)
+  → producer_binance.py → Avro serialize
+  → Kafka topic: crypto_klines (interval=1s)
+  → Flink: KeyDBKlineWriter → candle:1s:{symbol} (sorted set, TTL 8h)
+  → Flink: InfluxDBKlineWriter → InfluxDB candles (interval=1s)
+  → Flink KlineWindowAggregator:
+       - Mỗi giây nhận 1 candle, lưu vào MapState (dedup tự động)
+       - Khi bước qua phút mới → aggregate 60 giây → emit 1m candle
+       - Safety timer 65s: emit nếu stream im lặng > 65s
+       - Gap-fill: forward-fill close price cho giây bị thiếu
+  → emit 1m candle
+  → Flink: KeyDBKlineWriter → candle:1m:{symbol} (sorted set, TTL 7 ngày)
+  → Flink: InfluxDBKlineWriter → InfluxDB candles (interval=1m)
+  → Flink: IndicatorWriter (chỉ is_closed=True)
+       → SMA20, SMA50, EMA12, EMA26
+       → KeyDB indicator:latest:{symbol}
+       → InfluxDB indicators measurement
+
+Binance WS (@aggTrade mỗi symbol)
+  → Kafka: crypto_trades
+  → Flink: TradeWriter → KeyDB trades:{symbol} (list, max 100)
+
+Binance WS (@depth20@100ms mỗi symbol)
+  → Kafka: crypto_depth
+  → Flink: DepthWriter → KeyDB orderbook:{symbol} (hash)
+```
+
+### 3.2 Batch path (lịch sử)
+
+```
+Dagster schedule (daily 02:00 UTC):
+  spark-submit backfill_historical.py --mode all --iceberg-mode incremental
+    - Lấy timestamp mới nhất trong Iceberg historical_hourly
+    - Binance REST API: kéo 1h klines từ đó đến nay → Iceberg
+    - Detect gap InfluxDB 7 ngày → fill từ Binance REST → InfluxDB
+
+Dagster schedule (daily 03:00 UTC):
+  spark-submit aggregate_candles.py
+    - Đọc InfluxDB 1m → aggregate → 1h → ghi lại InfluxDB
+    - Đọc Iceberg historical_hourly → aggregate → coin_klines_hourly
+    - Xóa InfluxDB 1m data cũ hơn RETENTION_1M_DAYS ngày (mặc định 90)
+```
+
+### 3.3 API serving path
+
+```
+GET /api/klines?symbol=BTCUSDT&interval=5m&limit=200
+  → klines.py:
+    1. Kiểm tra Redis cache klines_cache:{symbol}:{interval}:{limit} (100ms TTL)
+    2. Nếu miss: đọc KeyDB candle:1m (7 ngày gần nhất) qua ZRANGEBYSCORE
+    3. Nếu không đủ limit: fallback InfluxDB range(start: -90d) → thêm data, dedup
+    4. Client-side aggregate: 1m → 5m/15m/1h/4h/1d/1w (bucketing theo interval)
+    5. Merge in-progress candle:
+       - Build từ candle:1s sub-candles trong phút hiện tại
+       - Enrich close/high/low từ ticker nếu ticker_ts > last_1s_ts
+    6. Cache 100ms → trả về JSON array
+
+GET /api/klines?symbol=BTCUSDT&interval=5m&limit=200&endTime=1772965200000 (scroll-left)
+  → klines.py:
+    - Bỏ qua cache và KeyDB (chỉ 7 ngày, không đủ cho scroll xa)
+    - start_ms = endTime - limit * interval_seconds * 1000
+    - Query InfluxDB: range(start: RFC3339_start, stop: RFC3339_end) (absolute range)
+    - Aggregate 1m → 5m nếu cần
+    - Trả về candles có openTime < endTime, lấy limit cuối
+
+WS /api/stream?symbol=BTCUSDT&interval=1m
+  → ws.py:
+    - Loop 0.5s
+    - Đọc candle:1s đủ tất cả seconds của phút hiện tại
+    - Aggregate → 1m candle với đúng OHLCV
+    - Enrich close từ ticker nếu ticker mới hơn last 1s candle
+    - Push nếu có thay đổi (diff check)
 ```
 
 ---
 
-## 5. Các loại dữ liệu & Schema
+## 4. Lớp Data (Data Layer)
 
-### 5.1. Ticker (Thống kê 24h)
+### 4.1 Apache Kafka 3.9.0 (KRaft mode)
 
-**Nguồn**: Binance WebSocket `!ticker@arr`  
-**Kafka Topic**: `crypto_ticker`
+- **Không cần Zookeeper** — KRaft built-in Raft consensus tự quản lý metadata
+- **Config quan trọng:** `KAFKA_NUM_PARTITIONS=3`, retention 48h, LZ4 compression
+- **4 topics:**
+  - `crypto_ticker` — 24h stats cho tất cả ~400 USDT pairs (batch throttled)
+  - `crypto_klines` — 1s kline candles, ~400 symbols × 1 msg/giây ≈ 400 msg/s
+  - `crypto_trades` — aggregate trades (1 msg per aggTrade event)
+  - `crypto_depth` — order book depth snapshots top-20 (100ms interval per symbol)
+- **Port:** 9092 (internal `kafka:9092`)
+
+### 4.2 Apicurio Schema Registry 2.6.2
+
+- Confluent-compatible API tại `/apis/ccompat/v7`
+- Producer đăng ký 4 Avro schemas lúc cold start: ticker, kline, trade, depth
+- Wire format: `0x00` magic byte + 4-byte big-endian schema_id + Avro binary
+- Flink consumer: `AvroDeserializer` dùng schema_id để lookup schema, deserialize message
+- **Port:** 8085 → internal 8080
+
+### 4.3 KeyDB (Redis-compatible hot cache)
+
+High-performance fork của Redis hỗ trợ multi-threading và Server Assisted Client Caching.
+
+- **Cấu hình:** `maxmemory 2560mb`, `maxmemory-policy allkeys-lru`, `hz 50`
+- **Port:** 6379
+
+Xem chi tiết key patterns tại [Section 11](#11-keydb--cấu-trúc-key-và-ttl).
+
+### 4.4 InfluxDB 2.7 (Warm time-series storage)
+
+Time-series database tối ưu cho dữ liệu có timestamp liên tục. Lưu ~90 ngày dữ liệu 1m candles.
+
+- **Org:** `vi`, **Bucket:** `crypto`
+- **Query language:** Flux (functional pipeline)
+- **Port:** 8086
+
+Xem chi tiết measurements tại [Section 12](#12-influxdb--measurement-và-retention).
+
+### 4.5 PostgreSQL 16
+
+Lưu metadata cho 2 mục đích:
+
+1. **Dagster metadata:** scheduler state, run history, asset materialization events
+2. **Iceberg catalog:** table definitions, partition specs, snapshot history, file locations
+
+- Databases: `dagster` và `iceberg_catalog`
+- **Port:** 5432 (internal)
+
+### 4.6 MinIO (S3-compatible object storage)
+
+- **Buckets:**
+  - `cryptoprice` — Iceberg data files (Parquet), table metadata JSON
+  - `flink-checkpoints` — Flink job checkpoints (RocksDB snapshots)
+- **Port:** 9000 (API), 9001 (console UI: http://localhost:9001)
+
+---
+
+## 5. Lớp Compute (Processing Layer)
+
+### 5.1 Apache Flink 1.18.1 — Speed Layer
+
+**2 containers:** `flink-jobmanager` (1.75GB RAM) và `flink-taskmanager` (4.5GB RAM)
+
+**Job file:** `src/ingest_flink_crypto.py` — PyFlink, submit qua REST API
+
+**Checkpointing:**
+- Backend: RocksDB incremental checkpoints
+- Interval: 60s
+- Storage: MinIO `flink-checkpoints/`
+- Failover: Tự động restart từ checkpoint gần nhất khi job crash
+
+**Web UI:** http://localhost:8081
+
+Job tạo ra **5 processing pipelines song song:**
+
+#### Pipeline 1 — Ticker → KeyDB + InfluxDB
+
+```
+Source: crypto_ticker (Kafka, Avro)
+  ↓
+KeyDBWriter (MapFunction):
+  - Buffer 100 messages, flush mỗi 0.5s
+  - Ghi ticker:latest:{symbol} (HSET)
+  - Ghi ticker:history:{symbol} (ZADD, cleanup khi > 1000 entries)
+  ↓
+InfluxDBWriter (MapFunction):
+  - Buffer 200 messages, flush mỗi 0.5s
+  - Ghi market_ticks measurement
+```
+
+#### Pipeline 2 — Raw 1s candles → KeyDB + InfluxDB
+
+```
+Source: crypto_klines (Kafka, Avro, filter: interval="1s")
+  ↓
+KeyDBKlineWriter:
+  - ZREMRANGEBYSCORE(key, ts, ts)  # dedup
+  - ZADD candle:1s:{symbol} ts json
+  - EXPIRE candle:1s:{symbol} 28800  # 8h
+  ↓
+InfluxDBKlineWriter:
+  - Ghi candles measurement (interval tag = "1s")
+```
+
+#### Pipeline 3 — 1s → 1m Window Aggregation
+
+```
+Source: crypto_klines (Kafka, Avro, filter: interval="1s")
+  ↓
+KlineWindowAggregator (KeyedProcessFunction, key=symbol):
+  [State: MapState<kline_start_ms, candle_json>]
+  [State: ValueState<window_start_ms>]
+  [State: ValueState<timer_ts>]
+  [State: ValueState<symbol_name>]
+
+  processElement(candle):
+    - map_state[kline_start_ms] = candle  # dedup giống HashMap
+    - nếu kline_start_ms bước qua phút mới (> window_start + 60000):
+        → _flush_window(): aggregate all 1s candles → emit 1m candle
+        → update window_start = new minute
+        → cancel timer cũ, đăng ký timer mới window_start + 65000
+
+  on_timer(timestamp):
+    - Kiểm tra timestamp == saved_timer_ts (tránh stale timer)
+    - _flush_window() với gap-fill: forward-fill close cho giây thiếu
+    - Emit 1m candle ngay cả khi ít hơn 60 sub-candles
+
+  _flush_window():
+    - Sort entries theo timestamp
+    - Gap-fill (ít nhất 1 giây → fill với close từ giây trước)
+    - open = first.open, high = max(high), low = min(low)
+    - close = last.close, volume = sum(volume)
+    - Emit JSON message
+  ↓
+(emit 1m candle)
+  ↓  ↓  ↓
+KeyDBKlineWriter  InfluxDBKlineWriter  IndicatorWriter
+ candle:1m          candles(1m)          SMA/EMA
+```
+
+#### Pipeline 4 — Depth → KeyDB
+
+```
+Source: crypto_depth (Kafka, Avro)
+  ↓
+DepthWriter (MapFunction):
+  - Buffer 50, flush 0.3s
+  - HSET orderbook:{symbol} bids (json) asks (json) ts last_update_id
+```
+
+#### Pipeline 5 — Trades → KeyDB
+
+```
+Source: crypto_trades (Kafka, Avro)
+  ↓
+TradeWriter (MapFunction):
+  - LPUSH trades:{symbol} json
+  - LTRIM trades:{symbol} 0 99  # giữ 100 gần nhất
+```
+
+### 5.2 Apache Spark 3.5 — Batch Layer
+
+**2 containers:** `spark-master` và `spark-worker` (4GB RAM, 4 vCores)
+
+Spark chỉ chạy khi được gọi bởi Dagster (không idle). Các jobs:
+
+#### `src/backfill_historical.py`
+
+```
+--mode populate:
+  Khởi tạo lần đầu — kéo 90 ngày 1m candles từ Binance REST
+  Multi-threaded (5 workers), batch 1000 candles/request
+  Delay 120ms giữa requests (Binance rate limit: 1200 req/min)
+  Ghi InfluxDB theo batch 500 write points
+
+--mode influx:
+  Query InfluxDB tìm gap (khoảng thiếu dữ liệu)
+  Fill gap từ Binance REST 1m API
+  Use case: máy tắt, Kafka consumer lag, Flink job crash
+
+--mode iceberg:
+  Gọi Spark job để ghi Iceberg (dùng Spark DataFrame API)
+  Đọc Binance REST 1h API → DataFrame → write Iceberg incremental
+
+--mode all --iceberg-mode incremental:
+  Chạy cả influx + iceberg incremental (dùng bởi Dagster daily)
+```
+
+#### `src/aggregate_candles.py`
+
+```
+Input: InfluxDB 1m candles (query Flux → DataFrame)
+Processing: Spark resample 1m → aggregate → 1h
+  - openTime = floor(openTime / 3600000) * 3600000
+  - open = first, high = max, low = min, close = last, volume = sum
+Output: InfluxDB write (1h interval tag)
+
+Input: Iceberg historical_hourly
+Processing: Spark aggregate → coin_klines_hourly
+Output: Iceberg upsert
+
+Cleanup: Delete InfluxDB 1m points older than RETENTION_1M_DAYS
+```
+
+#### `src/iceberg_maintenance.py`
+
+```
+expireSnapshots(older_than=30_days)
+rewriteDataFiles(target_file_size=128MB)  # compact small Parquet files
+```
+
+**Spark History Server:** http://localhost:18080
+
+---
+
+## 6. Lớp Query & Orchestration
+
+### 6.1 Trino 442 — Federated Query Engine
+
+- Query xuyên source mà không cần copy data
+- FastAPI dùng Trino JDBC/Python client để query Iceberg tables qua `/api/klines/historical`
+- **Catalog:** `iceberg` — kết nối MinIO (Parquet) + PostgreSQL (catalog metadata)
+- **Use case:** DateRangePicker query dài hạn (ví dụ: cả năm 2024), chỉ query Iceberg, không phải InfluxDB
+- **Port:** 8083 → internal 8080
+
+### 6.2 Dagster — Workflow Orchestration
+
+**2 containers:** `dagster-webserver` + `dagster-daemon`
+
+State lưu trong PostgreSQL `dagster` database.
+
+**`orchestration/assets.py`:**
+
+| Asset | Mô tả | Schedule |
+|---|---|---|
+| `backfill_historical` | `spark-submit backfill_historical.py --mode all --iceberg-mode incremental` | Daily 02:00 UTC |
+| `aggregate_candles` | `spark-submit aggregate_candles.py` — 1m→1h + retention cleanup | Daily 03:00 UTC |
+| `iceberg_maintenance` | `spark-submit iceberg_maintenance.py` — compact + expire | Weekly Sunday 04:00 UTC |
+
+Dagster Daemon poll schedule mỗi 30s, tạo Run khi đến schedule, submit Spark job qua subprocess, stream log vào Dagster UI.
+
+**Web UI:** http://localhost:3000
+
+---
+
+## 7. Lớp Serving (FastAPI)
+
+`serving/` — FastAPI app với 8 routers, tất cả mount dưới `/api/`
+
+### 7.1 `main.py`
+
+```python
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
+app.include_router(klines.router)
+app.include_router(ws.router)
+app.include_router(ticker.router)
+# ... các routers khác
+
+@app.get("/api/health")
+async def health():
+    # ping KeyDB + InfluxDB + Trino
+    # trả về {"status": "healthy", "services": {...}}
+```
+
+### 7.2 `connections.py`
+
+Singleton pattern — tạo connection 1 lần, dùng lại:
+
+```python
+_redis_client = None
+async def get_redis() -> aioredis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = await aioredis.from_url("redis://keydb:6379")
+    return _redis_client
+
+# get_influx() và get_trino_connection() tương tự
+```
+
+### 7.3 `routers/klines.py` — Router quan trọng nhất
+
+**Endpoint:** `GET /api/klines?symbol=&interval=&limit=&endTime=`
+
+**`_base_interval(interval)`** — quyết định resolution nào query từ KeyDB/InfluxDB:
+
+| Request interval | Query interval | Source |
+|---|---|---|
+| `1s` | `1s` | `candle:1s` (KeyDB) |
+| `1m` | `1m` | `candle:1m` (KeyDB) |
+| `5m`, `15m` | `1m` | `candle:1m` (KeyDB) → aggregate |
+| `1h`, `4h` | `1m` | `candle:1m` → aggregate (hoặc `1h` nếu span dài) |
+| `1d`, `1w` | `1h` | InfluxDB 1h → aggregate |
+
+**`_aggregate(candles, target_ms)`** — OHLCV re-sampling:
+
+```python
+buckets = {}
+for c in candles:
+    key = (c["openTime"] // target_ms) * target_ms  # floor to bucket
+    if key not in buckets:
+        buckets[key] = [c]
+    else:
+        buckets[key].append(c)
+
+result = []
+for key, group in sorted(buckets.items()):
+    result.append({
+        "openTime": key,
+        "open": group[0]["open"],
+        "high": max(c["high"] for c in group),
+        "low": min(c["low"] for c in group),
+        "close": group[-1]["close"],
+        "volume": sum(c["volume"] for c in group),
+    })
+```
+
+**`_query_influx_sync(symbol, interval, limit, range_h, end_ms)`:**
+
+```python
+if end_ms:  # scroll-left — absolute range
+    stop_dt = datetime.utcfromtimestamp(end_ms / 1000).isoformat() + "Z"
+    start_ms = end_ms - limit * interval_seconds * 1000 * BUFFER_FACTOR
+    start_dt = datetime.utcfromtimestamp(start_ms / 1000).isoformat() + "Z"
+    range_str = f'range(start: {start_dt}, stop: {stop_dt})'
+else:  # real-time — relative range
+    range_str = f'range(start: -{range_h}h)'
+    
+query = f"""
+from(bucket: "crypto")
+  |> {range_str}
+  |> filter(fn: (r) => r._measurement == "candles")
+  |> filter(fn: (r) => r.symbol == "{symbol}")
+  |> filter(fn: (r) => r.interval == "{interval}")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+  |> tail(n: {limit})
+"""
+```
+
+**Flow chi tiết cho real-time request:**
+
+```
+1. Cache hit? → return immediately (100ms TTL)
+
+2. KeyDB: ZRANGEBYSCORE candle:1m:{symbol} -inf +inf
+   → parse JSON, sort by openTime, dedup by volume
+
+3. Đủ limit? Nếu không: InfluxDB query -90d
+   → merge, dedup (giữ entry có volume cao hơn cùng timestamp)
+
+4. Aggregate 1m → target interval
+
+5. In-progress candle:
+   a. ZRANGEBYSCORE candle:1s:{symbol} current_minute_start +inf
+   b. Aggregate 1s candles → {open, high, low, close, volume}
+   c. HGET ticker:latest:{symbol}
+   d. Nếu ticker.event_time > last_1s_candle.kline_start → override close/high/low
+
+6. Cache 100ms, return
+```
+
+### 7.4 `routers/ws.py` — WebSocket real-time
+
+**Endpoint:** `WS /api/stream?symbol=&interval=`
+
+**`_build_candle(symbol, interval)`:**
+
+```python
+if interval == "1s":
+    # Lấy candle 1s mới nhất từ candle:1s sorted set
+    raw = await redis.zrange(f"candle:1s:{symbol}", -1, -1, withscores=True)
+    candle = json.loads(raw[0])
+    # Nếu ticker.event_time > candle.kline_start → enrich close/high/low
+    
+elif interval in ("1m", "5m", ...):
+    source_key = "candle:1s" if interval == "1m" else "candle:1m"
+    # Tính window start cho phút/period hiện tại
+    window_start = (now_ms // interval_ms) * interval_ms
+    # ZRANGEBYSCORE: lấy tất cả candles trong window hiện tại
+    subs = await redis.zrangebyscore(f"{source_key}:{symbol}", window_start, "+inf")
+    # Aggregate → {open, high, low, close, volume}
+    candle = _aggregate_subs(subs)
+    # Enrich từ ticker chỉ khi ticker mới hơn sub-candle mới nhất
+    if ticker["event_time"] > latest_sub_ts:
+        candle["close"] = ticker["price"]
+        candle["high"] = max(candle["high"], ticker["price"])
+        candle["low"] = min(candle["low"], ticker["price"])
+```
+
+**Push logic:** So sánh với candle trước → push nếu diff > threshold → tránh spam WebSocket.
+
+### 7.5 Tất cả API Endpoints
+
+| Method | Endpoint | Source | Mô tả |
+|---|---|---|---|
+| GET | `/api/klines` | KeyDB → InfluxDB | OHLCV candles, hỗ trợ scroll-left qua `endTime` |
+| WS | `/api/stream` | KeyDB (real-time) | Live candle stream, 0.5s interval |
+| GET | `/api/ticker/{symbol}` | KeyDB `ticker:latest` | Price, bid, ask, 24h change |
+| GET | `/api/ticker` | KeyDB scan | Tất cả tickers |
+| GET | `/api/orderbook/{symbol}` | KeyDB `orderbook` | Top-20 bid/ask depth |
+| GET | `/api/trades/{symbol}` | KeyDB `trades` | 100 giao dịch gần nhất |
+| GET | `/api/symbols` | KeyDB scan | Danh sách tất cả symbols |
+| GET | `/api/indicators/{symbol}` | KeyDB `indicator:latest` | SMA20/50, EMA12/26 |
+| GET | `/api/klines/historical` | Trino → Iceberg | Long-range date queries |
+| GET | `/api/health` | All backends | Health check |
+
+---
+
+## 8. Lớp Frontend (React)
+
+Nginx serve React SPA + proxy API:
+- `location /api/` → `proxy_pass fastapi:8000`
+- `location /api/stream` → WebSocket upgrade: `proxy_pass fastapi:8000`, `Upgrade: websocket`
+
+**TimeFrame constants** (`frontend/src/constants/chartConstants.js`):
+
+```js
+export const TIMEFRAMES = ["1s", "1m", "5m", "15m", "1H", "4H", "1D", "1W"]
+```
+
+Lưu ý uppercase H/D/W — tất cả API calls dùng `.toLowerCase()` trước khi gửi backend.
+
+### 8.1 `marketDataService.js`
+
+Service layer duy nhất giữa components và backend API:
+
+```js
+// endTime tính bằng SECONDS (lightweight-charts convention)
+// Khi gọi API, convert sang ms: endTime * 1000
+fetchCandles(symbol, timeframe, limit = 200, endTime = null)
+  → GET /api/klines?symbol=&interval=&limit=[&endTime=ms]
+
+// Trả về hàm unsubscribe
+subscribeCandle(symbol, timeframe, onCandle)
+  → WS /api/stream?symbol=&interval=
+  → const unsub = subscribeCandle(...); // cleanup khi unmount
+
+fetchHistoricalCandles(symbol, startMs, endMs, limit)
+  → GET /api/klines/historical?...
+
+fetchOrderBook(symbol) → GET /api/orderbook/{symbol}
+fetchTrades(symbol) → GET /api/trades/{symbol}
+fetchSymbols() → GET /api/symbols
+```
+
+### 8.2 `CandlestickChart.js` — Component chính (~600 dòng)
+
+**State & Refs quan trọng:**
+
+| Ref/State | Mô tả |
+|---|---|
+| `candlesRef` | Mảng candles hiện tại (không re-render, dùng cho WS callback) |
+| `earliestTimestampRef` | Timestamp cũ nhất — dùng làm endTime khi scroll-left |
+| `isLoadingMoreRef` | Lock boolean — tránh concurrent scroll-left requests |
+| `chartRef` | lightweight-charts `IChartApi` instance |
+| `candleRef` | `ICandlestickSeriesApi` — series chính |
+| `volumeRef` | `IHistogramSeriesApi` — volume bars |
+| `smaSeries`, `emaSeries` | Indicator series |
+
+**3 luồng cập nhật chart độc lập:**
+
+#### Luồng 1: Initial load
+```
+useEffect([symbol, timeframe]):
+  fetchCandles(symbol, tf, 200) → applyDataToChart(data)
+  
+applyDataToChart(data):
+  candleRef.setData(data)          // FULL replace (không append)
+  volumeRef.setData(volumeData)
+  recalculate SMA, EMA → set data
+  chartRef.timeScale().fitContent()
+  update earliestTimestampRef = data[0].time
+```
+
+#### Luồng 2: WebSocket real-time (1 candle/message)
+```
+subscribeCandle(symbol, tf, onCandle):
+  onCandle(candle):
+    if tf == "1s":
+      if candle.time <= candlesRef.last.time → skip (stale)
+      candleRef.update(candle)    // append or update last bar
+    else (1m+):
+      candleRef.update(candle)    // lightweight-charts handles append vs update
+      update candlesRef
+```
+
+#### Luồng 3: Poll incremental (bù cho WS gaps)
+```
+setInterval(1000ms) → fetchCandles(symbol, tf, 3):
+  pollIncremental(newCandles):
+    for each newCandle in newCandles:
+      idx = candlesRef.findIndex(c => c.time == newCandle.time)
+      
+      if idx == candlesRef.length - 1 && tf >= 1m:
+        SKIP  // WS là authoritative cho candle đang chạy
+              // Tránh flicker giữa REST và WS
+      
+      if idx found && changed:
+        candleRef.update(newCandle)  // cập nhật bar đã đóng
+      
+      if not found && newCandle.time > candlesRef.last.time:
+        candleRef.update(newCandle)  // append candle mới
+        candlesRef.push(newCandle)
+```
+
+**Tại sao dùng cả WS và poll?**
+- WS: cực nhanh (0.5s lag), nhưng có thể miss message nếu network jitter
+- Poll: đảm bảo không miss candle đã đóng (closed candles quan trọng hơn)
+- Poll skip live bar → WS không bị REST giá trị cũ override (không flicker)
+
+#### Scroll-left loading
+
+```
+onVisibleLogicalRangeChanged(range):
+  if range.from < 20 && !isLoadingMoreRef:
+    isLoadingMoreRef = true
+    earliestTime = candlesRef[0].time      // seconds (lightweight-charts)
+    
+    fetchCandles(symbol, tf, 500, earliestTime):
+      // API nhận endTime=earliestTime*1000 ms
+      // Trả về 500 candles trước earliestTime
+    
+    newCandles = result.filter(c => c.time < earliestTime)
+    merged = [...newCandles, ...candlesRef.current]
+    
+    // Chart re-render với merged data
+    candleRef.setData(merged)
+    
+    // Khôi phục viewport position (shift offset)
+    const shift = newCandles.length
+    chartRef.timeScale().scrollToPosition(-shift, false)
+    
+    update earliestTimestampRef = merged[0].time
+    isLoadingMoreRef = false
+```
+
+---
+
+## 9. Chi tiết từng file source code
+
+| File | Dòng code | Chức năng chính |
+|---|---|---|
+| `src/producer_binance.py` | ~320 | Binance WS → Kafka Avro producer |
+| `src/ingest_flink_crypto.py` | ~1070 | Flink job: 5 pipelines, 8 writer classes |
+| `src/backfill_historical.py` | ~400 | Multi-mode backfill script (Spark/direct) |
+| `src/aggregate_candles.py` | ~200 | Spark 1m→1h aggregation + retention |
+| `src/candle_query_helper.py` | ~150 | Shared Flux query helpers |
+| `src/iceberg_maintenance.py` | ~100 | Iceberg compaction + snapshot expiry |
+| `serving/main.py` | ~60 | FastAPI app root, CORS, routers |
+| `serving/connections.py` | ~80 | Singleton connection management |
+| `serving/routers/klines.py` | ~310 | OHLCV REST endpoint (core logic) |
+| `serving/routers/ws.py` | ~220 | WebSocket real-time candle stream |
+| `serving/routers/ticker.py` | ~80 | Ticker price/stats endpoint |
+| `serving/routers/historical.py` | ~120 | Trino-based historical queries |
+| `serving/routers/orderbook.py` | ~50 | Order book depth endpoint |
+| `serving/routers/trades.py` | ~50 | Recent trades endpoint |
+| `orchestration/assets.py` | ~120 | Dagster asset + schedule definitions |
+| `frontend/src/components/CandlestickChart.js` | ~620 | Main chart component |
+| `frontend/src/services/marketDataService.js` | ~260 | API service layer |
+
+---
+
+## 10. Kafka topics và Avro schemas
+
+### `crypto_ticker` (`schemas/ticker.avsc`)
 
 ```json
 {
-  "event_time": 1710000000000,
   "symbol": "BTCUSDT",
-  "close": 67500.5,
-  "bid": 67500.0,
-  "ask": 67501.0,
-  "24h_open": 66800.0,
-  "24h_high": 68200.0,
-  "24h_low": 66500.0,
-  "24h_volume": 12345.678,
-  "24h_quote_volume": 834567890.12,
-  "24h_price_change": 700.5,
-  "24h_price_change_pct": 1.048,
-  "trade_count": 567890
+  "event_time": 1772965200000,
+  "close": 83500.00,
+  "bid": 83499.00,
+  "ask": 83501.00,
+  "h24_open": 82000.00,
+  "h24_high": 84000.00,
+  "h24_low": 81500.00,
+  "h24_volume": 12345.67,
+  "h24_quote_volume": 1029876543.21,
+  "h24_price_change": 1500.00,
+  "h24_price_change_pct": 1.83,
+  "h24_trade_count": 987654
 }
 ```
 
-**Lưu trữ**:
-| Database | Key/Measurement | TTL |
-|----------|-----------------|-----|
-| KeyDB | `ticker:latest:{symbol}` (Hash) | Không (overwrite) |
-| KeyDB | `ticker:history:{symbol}` (Sorted Set) | 5 phút |
-| InfluxDB | `market_ticks` | Theo bucket retention |
-| Iceberg | `coin_ticker` | Vĩnh viễn |
-
-### 5.2. Kline (Dữ liệu nến)
-
-**Nguồn**: Binance WebSocket `<symbol>@kline_1s`  
-**Kafka Topic**: `crypto_klines`
+### `crypto_klines` (`schemas/kline.avsc`)
 
 ```json
 {
-  "event_time": 1710000000000,
   "symbol": "BTCUSDT",
-  "kline_start": 1709999940000,
-  "kline_close": 1709999999999,
   "interval": "1s",
-  "open": 67480.0,
-  "high": 67520.0,
-  "low": 67470.0,
-  "close": 67500.5,
-  "volume": 12.345,
-  "quote_volume": 833456.78,
-  "trade_count": 234,
-  "is_closed": true
+  "kline_start": 1772965200000,
+  "kline_close": 1772965200999,
+  "open": 83500.00,
+  "high": 83510.00,
+  "low": 83495.00,
+  "close": 83505.00,
+  "volume": 1.234,
+  "quote_volume": 103142.37,
+  "trade_count": 45,
+  "is_closed": false,
+  "event_time": 1772965200500
 }
 ```
 
-**Lưu trữ**:
-| Database | Key/Measurement | Interval | TTL |
-|----------|-----------------|----------|-----|
-| KeyDB | `candle:1s:{symbol}` | 1s | 8 giờ |
-| KeyDB | `candle:1m:{symbol}` | 1m | 7 ngày |
-| KeyDB | `candle:latest:{symbol}` | latest | Không |
-| InfluxDB | `candles` interval=1s | 1s | 7 ngày |
-| InfluxDB | `candles` interval=1m | 1m | 90 ngày |
-| InfluxDB | `candles` interval=1h | 1h | Vĩnh viễn |
-| Iceberg | `coin_klines` | 1m | Vĩnh viễn |
-| Iceberg | `coin_klines_hourly` | 1h | Vĩnh viễn |
-
-### 5.3. Order Book (Sổ lệnh)
-
-**Nguồn**: Binance WebSocket `<symbol>@depth20@100ms`  
-**Kafka Topic**: `crypto_depth`
+### `crypto_trades` (`schemas/trade.avsc`)
 
 ```json
 {
-  "event_time": 1710000000050,
   "symbol": "BTCUSDT",
-  "bids": [["67500.00", "1.234"], ["67499.50", "2.567"]],
-  "asks": [["67501.00", "0.890"], ["67501.50", "1.456"]],
-  "lastUpdateId": 45678901234
+  "event_time": 1772965200123,
+  "agg_trade_id": 123456789,
+  "price": 83505.00,
+  "quantity": 0.01234,
+  "trade_time": 1772965200100,
+  "is_buyer_maker": false
 }
 ```
 
-**Lưu trữ**:
-| Database | Key | TTL |
-|----------|-----|-----|
-| KeyDB | `orderbook:{symbol}` (Hash) | 60 giây |
+### `crypto_depth` (`schemas/depth.avsc`)
 
-> Order book chỉ lưu vào KeyDB vì tần suất cao và tính chất volatile.
-
-### 5.4. Indicators (Chỉ báo kỹ thuật)
-
-**Tính toán bởi**: `ingest_flink_crypto.py` từ dữ liệu kline đã đóng.
-
-| Indicator | Thuật toán | Kỳ |
-|-----------|------------|-----|
-| SMA-20 | Trung bình 20 giá đóng cuối | 20 |
-| SMA-50 | Trung bình 50 giá đóng cuối | 50 |
-| EMA-12 | Exponential weighted (α = 2/13) | 12 |
-| EMA-26 | Exponential weighted (α = 2/27) | 26 |
-
-**Lưu trữ**:
-| Database | Key/Measurement |
-|----------|-----------------|
-| KeyDB | `indicator:latest:{symbol}` |
-| InfluxDB | `indicators` |
-
-### 5.5. Ma trận lưu trữ
-
-```
-┌─────────────────────┬──────────┬──────────┬──────────┬──────────┐
-│                     │  KeyDB   │ InfluxDB │ Iceberg  │  Trino   │
-│    Loại dữ liệu     │(hot/live)│(time-ser)│(cold/DL) │(SQL qry) │
-├─────────────────────┼──────────┼──────────┼──────────┼──────────┤
-│ Ticker (24h stats)  │    ✅    │    ✅    │    ✅    │    ✅    │
-│ Klines (nến 1s/1m)  │    ✅    │    ✅    │    ✅    │    ✅    │
-│ Klines (nến 1h agg) │    —     │    ✅    │    ✅    │    ✅    │
-│ Order Book (depth)  │    ✅    │    —     │    —     │    —     │
-│ Indicators (SMA/EMA)│    ✅    │    ✅    │    —     │    —     │
-└─────────────────────┴──────────┴──────────┴──────────┴──────────┘
-```
-
----
-
-## 6. Luồng dữ liệu End-to-End
-
-### 6.1. Real-time Pipeline (Speed Layer)
-
-```
-Binance WS → Producer → Kafka → Flink → KeyDB + InfluxDB
-     │                                      │
-     │ ~100ms                               │ ~500ms
-     ▼                                      ▼
-  WebSocket                              FastAPI
-  connection                             queries
-```
-
-**Chi tiết**:
-1. **Producer** (`producer_binance.py`):
-   - Mở 8+ WebSocket connections đến Binance
-   - Chia 400 symbols thành groups 50 symbols/connection
-   - Serialize thành Avro với Confluent wire format
-   - Gửi vào 3 Kafka topics: `crypto_ticker`, `crypto_klines`, `crypto_depth`
-
-2. **Flink** (`ingest_flink_crypto.py`):
-   - Đọc từ 3 Kafka topics
-   - **Ticker stream**: → KeyDB `ticker:latest:*` + InfluxDB `market_ticks`
-   - **Kline stream**:
-     - Raw 1s → KeyDB `candle:1s:*` + InfluxDB `candles` interval=1s
-     - Aggregate 1s→1m (in-flight) → KeyDB `candle:1m:*` + InfluxDB `candles` interval=1m
-     - Closed 1m → Calculate SMA/EMA → KeyDB `indicator:latest:*`
-   - **Depth stream**: → KeyDB `orderbook:*`
-
-### 6.2. Batch Pipeline
-
-```
-Dagster Schedule → Spark Jobs → InfluxDB / Iceberg
-```
-
-**Jobs**:
-| Job | Tần suất | Chức năng |
-|-----|----------|-----------|
-| `aggregate_candles.py` | Hàng ngày 4AM | 1m→1h aggregation, xóa 1m cũ |
-| `iceberg_maintenance.py` | Chủ nhật 3AM | Compact files, expire snapshots |
-| `backfill_historical.py` | Theo yêu cầu | Bù đắp gaps, populate historical |
-
-### 6.3. Query Flow
-
-```
-React → Nginx → FastAPI → {KeyDB, InfluxDB, Trino}
-```
-
-**Routing ưu tiên API `/api/klines`**:
-1. **Check cache** (100ms TTL)
-2. **KeyDB** (candle:1s hoặc candle:1m) — ưu tiên
-3. **InfluxDB** — fallback nếu KeyDB không đủ
-4. **Server-side aggregation** — nếu cần (1m→5m, 1h→4h)
-5. **Merge live ticker** — vào candle cuối cùng
-6. **Return + Cache**
-
----
-
-## 7. Chi tiết từng Component
-
-### 7.1. Producer (`src/producer_binance.py`)
-
-**Chức năng**: Kết nối Binance WebSocket, serialize Avro, gửi Kafka.
-
-| Tham số | Giá trị | Mô tả |
-|---------|---------|-------|
-| Symbols | ~400 | Tất cả USDT pairs đang TRADING |
-| Connections/stream | 8 | 50 symbols/connection |
-| Compression | lz4 | Kafka message compression |
-| Batch size | 64KB | Kafka producer batch |
-| Heartbeat | 5s | WebSocket ping interval |
-
-### 7.2. Flink Pipeline (`src/ingest_flink_crypto.py`)
-
-**Classes chính**:
-
-| Class | Output | Batch/Flush |
-|-------|--------|-------------|
-| `KeyDBWriter` | `ticker:latest:*`, `ticker:history:*` | 100/0.5s |
-| `InfluxDBWriter` | `market_ticks` measurement | 200/0.5s |
-| `KeyDBKlineWriter` | `candle:1s:*`, `candle:1m:*` | 50/0.5s |
-| `InfluxDBKlineWriter` | `candles` measurement | 500/3s |
-| `KlineWindowAggregator` | 1s→1m aggregation (KeyedProcessFunction) | Window 60s |
-| `IndicatorWriter` | `indicator:latest:*`, `indicators` | Per closed candle |
-| `DepthWriter` | `orderbook:*` | 50/0.3s |
-
-**KlineWindowAggregator** — Chi tiết:
-- **Window**: 60 giây (processing time)
-- **State**: MapState<kline_start_ms, JSON> per symbol
-- **Dedup**: Cùng timestamp → overwrite
-- **Gap-fill**: Forward-fill missing seconds với close price trước
-- **Safety timer**: 65s sau window open để đảm bảo emit
-
-### 7.3. Batch Jobs
-
-**`aggregate_candles.py`**:
-```bash
-python aggregate_candles.py --mode all
-```
-- Modes: `influx`, `iceberg`, `all`
-- Query 1m candles cũ hơn 90 ngày
-- Aggregate theo giờ: first(open), max(high), min(low), last(close), sum(volume)
-- Ghi 1h candles, xóa 1m cũ
-
-**`backfill_historical.py`**:
-```bash
-python backfill_historical.py --mode populate --days 90
-```
-- Modes: `influx` (gap fill), `iceberg` (historical), `populate` (force N days), `all`
-- ThreadPoolExecutor: 5 workers
-- Rate limiting: 120ms/request
-
-**`iceberg_maintenance.py`**:
-```bash
-python iceberg_maintenance.py
-```
-- Compact files (~128MB)
-- Rewrite manifests
-- Expire snapshots (>48h)
-- Remove orphan files (>72h)
-
-### 7.4. FastAPI Backend (`serving/`)
-
-**Cấu trúc routers**:
-
-| Router | Endpoint | Source | Mô tả |
-|--------|----------|--------|-------|
-| `klines.py` | `GET /api/klines` | KeyDB → InfluxDB | OHLCV candles |
-| `historical.py` | `GET /api/klines/historical` | Trino | Historical từ Iceberg |
-| `ticker.py` | `GET /api/ticker/{symbol}` | KeyDB | Live ticker |
-| `orderbook.py` | `GET /api/orderbook/{symbol}` | KeyDB | Order book |
-| `trades.py` | `GET /api/trades/{symbol}` | KeyDB | Recent ticks |
-| `symbols.py` | `GET /api/symbols` | KeyDB | Symbol list |
-| `indicators.py` | `GET /api/indicators/{symbol}` | KeyDB | SMA/EMA |
-| `ws.py` | `WS /api/stream` | KeyDB | Real-time streaming |
-
-### 7.5. Frontend React (`frontend/`)
-
-**Components chính**:
-
-| Component | File | Chức năng |
-|-----------|------|-----------|
-| `CandlestickChart` | `CandlestickChart.js` | Biểu đồ nến chính + indicators |
-| `Watchlist` | `Watchlist.js` | Danh sách symbols + prices |
-| `OrderBook` | `OrderBook.js` | Hiển thị sổ lệnh |
-| `RecentTrades` | `RecentTrades.js` | Giao dịch gần đây |
-| `MarketSelector` | `MarketSelector.js` | Dropdown chọn symbol |
-| `DrawingToolbar` | `DrawingToolbar.js` | Công cụ vẽ |
-
-**CandlestickChart** — Features:
-- Multi-timeframe: 1s, 1m, 5m, 15m, 1H, 4H, 1D, 1W
-- WebSocket real-time + incremental polling (không flicker)
-- Scroll-left loading (load thêm 500 candles, cooldown 500ms)
-- Indicators: SMA20, SMA50, EMA, RSI, MFI (toggle on/off)
-- OHLCV tooltip on hover
-- Export PNG
-
----
-
-## 8. API Endpoints
-
-### REST APIs
-
-| Method | Path | Tham số | Mô tả |
-|--------|------|---------|-------|
-| GET | `/api/health` | — | Health check |
-| GET | `/api/symbols` | — | Danh sách symbols |
-| GET | `/api/ticker/{symbol}` | — | Ticker 1 symbol |
-| GET | `/api/ticker` | — | Tất cả tickers |
-| GET | `/api/klines` | symbol, interval, limit, endTime | OHLCV candles |
-| GET | `/api/klines/historical` | symbol, startTime, endTime, limit | Historical (Iceberg) |
-| GET | `/api/orderbook/{symbol}` | — | Order book |
-| GET | `/api/trades/{symbol}` | limit | Recent trades |
-| GET | `/api/indicators/{symbol}` | — | SMA/EMA indicators |
-
-### WebSocket
-
-| Path | Query Params | Mô tả |
-|------|--------------|-------|
-| `WS /api/stream` | symbol, interval | Real-time candle streaming |
-
-**Ví dụ WebSocket**:
-```javascript
-const ws = new WebSocket('ws://localhost/api/stream?symbol=BTCUSDT&interval=1m');
-ws.onmessage = (event) => {
-  const candle = JSON.parse(event.data);
-  // { time: 1710000000, open: 67500, high: 67520, low: 67480, close: 67510, volume: 12.34 }
-};
-```
-
-### Response Examples
-
-**GET /api/klines?symbol=BTCUSDT&interval=1m&limit=5**:
-```json
-[
-  {"openTime": 1710000000000, "open": 67500, "high": 67520, "low": 67480, "close": 67510, "volume": 12.34},
-  {"openTime": 1710000060000, "open": 67510, "high": 67550, "low": 67500, "close": 67540, "volume": 15.67},
-  ...
-]
-```
-
-**GET /api/orderbook/BTCUSDT**:
 ```json
 {
-  "bids": [["67500.00", "1.234"], ["67499.50", "2.567"]],
-  "asks": [["67501.00", "0.890"], ["67501.50", "1.456"]],
-  "spread": "1.00",
-  "best_bid": "67500.00",
-  "best_ask": "67501.00"
+  "symbol": "BTCUSDT",
+  "event_time": 1772965200050,
+  "last_update_id": 987654321,
+  "bids": [["83499.00", "1.234"], ["83498.00", "2.100"]],
+  "asks": [["83501.00", "0.567"], ["83502.00", "1.890"]]
 }
 ```
 
 ---
 
-## 9. Hướng dẫn triển khai
+## 11. KeyDB — cấu trúc key và TTL
 
-### 9.1. Yêu cầu hệ thống
+| Key pattern | Type | TTL | Nội dung | Viết bởi |
+|---|---|---|---|---|
+| `ticker:latest:{symbol}` | Hash | None (overwritten) | price, bid, ask, volume, change24h, event_time | Flink KeyDBWriter |
+| `ticker:history:{symbol}` | Sorted Set | Cleanup auto | score=event_time, member=`price:volume` | Flink KeyDBWriter |
+| `candle:1s:{symbol}` | Sorted Set | 8h (28800s) | score=kline_start_ms, member=candle JSON | Flink KeyDBKlineWriter |
+| `candle:1m:{symbol}` | Sorted Set | 7d (604800s) | score=kline_start_ms, member=candle JSON | Flink KeyDBKlineWriter |
+| `candle:latest:{symbol}` | Hash | None | open/high/low/close/volume/kline_start/interval | Flink KeyDBKlineWriter |
+| `indicator:latest:{symbol}` | Hash | None | sma20, sma50, ema12, ema26, timestamp | Flink IndicatorWriter |
+| `orderbook:{symbol}` | Hash | None | bids (JSON), asks (JSON), ts, last_update_id | Flink DepthWriter |
+| `trades:{symbol}` | List | None | List of trade JSON, max 100 entries | Flink TradeWriter |
+| `klines_cache:{symbol}:{interval}:{limit}` | String | 100ms | Cached klines response JSON | FastAPI klines.py |
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
-| RAM | 16GB | 32GB |
-| CPU | 4 cores | 8 cores |
-| Disk | 50GB SSD | 200GB SSD |
-| Docker | 20.10+ | Latest |
-| Docker Compose | 2.0+ | Latest |
+**Candle JSON format** trong sorted set:
 
-### 9.2. Khởi động nhanh
+```json
+{
+  "t": 1772965200000,
+  "o": 83500.0,
+  "h": 83510.0,
+  "l": 83495.0,
+  "c": 83505.0,
+  "v": 1.234,
+  "qv": 103142.37,
+  "n": 45,
+  "x": false
+}
+```
+
+- `t`: kline_start ms, `o/h/l/c`: OHLC, `v`: base volume, `qv`: quote volume, `n`: trade count, `x`: is_closed
+
+---
+
+## 12. InfluxDB — measurement và retention
+
+### Measurement: `candles`
+
+- **Tags:** `symbol` (BTCUSDT), `exchange` ("binance"), `interval` ("1s" | "1m")
+- **Fields:** open, high, low, close, volume, quote_volume (float64); trade_count (int64); is_closed (bool)
+- **Time precision:** ms (epoch milliseconds)
+- **Data:** ~129,000 candles/symbol cho 90 ngày 1m data
+- **Retention:** Spark job xóa 1m data cũ hơn 90 ngày (aggregate_candles.py)
+
+### Measurement: `market_ticks`
+
+- **Tags:** `symbol`, `exchange`
+- **Fields:** price, bid, ask, volume, quote_volume, price_change_pct, trade_count
+- **Time:** event_time ms
+- **Source:** Flink InfluxDBWriter (từ crypto_ticker topic)
+
+### Measurement: `indicators`
+
+- **Tags:** `symbol`, `exchange`
+- **Fields:** sma20, sma50, ema12, ema26, close (float64)
+- **Time:** kline_start ms
+- **Source:** Flink IndicatorWriter (chỉ closed 1m candles)
+
+### Flux query mẫu (scroll-left absolute range):
+
+```flux
+from(bucket: "crypto")
+  |> range(start: 2026-01-01T00:00:00Z, stop: 2026-02-01T00:00:00Z)
+  |> filter(fn: (r) => r._measurement == "candles")
+  |> filter(fn: (r) => r.symbol == "BTCUSDT")
+  |> filter(fn: (r) => r.interval == "1m")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+  |> tail(n: 200)
+```
+
+---
+
+## 13. Iceberg / MinIO — cold storage
+
+### Table: `historical_hourly`
+
+Dữ liệu raw 1h candles từ Binance REST API, backfilled từ đầu lịch sử coin.
+
+| Column | Type | Mô tả |
+|---|---|---|
+| symbol | STRING | BTCUSDT |
+| open_time | BIGINT | Epoch ms |
+| open, high, low, close | DOUBLE | OHLC |
+| volume, quote_volume | DOUBLE | Volume |
+| trade_count | BIGINT | Số giao dịch |
+
+- **Partitioning:** `PARTITION BY (symbol, year(to_timestamp(open_time/1000)), month(to_timestamp(open_time/1000)))`
+- **Location:** `s3a://cryptoprice/historical_hourly/`
+
+### Table: `coin_klines_hourly`
+
+Dữ liệu 1h đã được aggregate từ Spark job, dùng cho Trino query.
+
+- **Schema:** Giống `historical_hourly`
+- **Location:** `s3a://cryptoprice/coin_klines_hourly/`
+
+### Iceberg metadata flow:
+
+```
+Spark write:
+  DataFrameWriter.format("iceberg")
+               .mode("append")
+               .save("iceberg.default.historical_hourly")
+  
+  → Parquet files: MinIO s3a://cryptoprice/historical_hourly/data/
+  → Metadata JSON: MinIO s3a://cryptoprice/historical_hourly/metadata/
+  → Snapshot catalog: PostgreSQL iceberg_catalog.iceberg_tables
+
+Trino read:
+  SELECT * FROM iceberg.default.coin_klines_hourly
+  WHERE symbol = 'BTCUSDT'
+    AND open_time BETWEEN 1704067200000 AND 1735689600000
+  ORDER BY open_time
+  
+  → Trino reads PostgreSQL catalog → discovers Parquet file locations in MinIO
+  → Reads Parquet files directly với column projection + predicate pushdown
+```
+
+---
+
+## 14. Dagster — Orchestration & Scheduling
+
+**`orchestration/assets.py`:**
+
+```python
+from dagster import asset, AssetExecutionContext, ScheduleDefinition
+
+@asset(group_name="ingestion", description="Daily backfill: Binance → Iceberg + InfluxDB gap fill")
+def backfill_historical(context: AssetExecutionContext):
+    subprocess.run(["spark-submit", 
+                    "/app/src/backfill_historical.py",
+                    "--mode", "all",
+                    "--iceberg-mode", "incremental"], check=True)
+
+@asset(group_name="maintenance", description="Daily aggregate 1m→1h + retention cleanup")
+def aggregate_candles(context: AssetExecutionContext):
+    subprocess.run(["spark-submit",
+                    "/app/src/aggregate_candles.py"], check=True)
+
+backfill_schedule = ScheduleDefinition(
+    job=define_asset_job("backfill_job", [backfill_historical]),
+    cron_schedule="0 2 * * *",  # daily 02:00 UTC
+)
+aggregate_schedule = ScheduleDefinition(
+    job=define_asset_job("aggregate_job", [aggregate_candles]),
+    cron_schedule="0 3 * * *",  # daily 03:00 UTC
+)
+```
+
+**`orchestration/workspace.yaml`:**
+
+```yaml
+load_from:
+  - python_file:
+      relative_path: assets.py
+      working_directory: /app/orchestration
+```
+
+---
+
+## 15. Startup & Vận hành
+
+### Khởi động lần đầu (First-time setup)
 
 ```bash
-# 1. Clone repository
-git clone <repo-url>
-cd cryptoprice_local
+# 1. Clone và cấu hình env
+git clone https://github.com/StupidDuck64/Lambda-Architecture-for-TradingView-Style-Platform.git
+cd Lambda-Architecture-for-TradingView-Style-Platform
+cp *.env .env
+# Edit .env: INFLUX_TOKEN, MINIO_ROOT_PASSWORD, POSTGRES_PASSWORD, ...
 
-# 2. Tạo file .env
-cp .env.example .env
-# Chỉnh sửa: INFLUX_TOKEN, MINIO_ROOT_USER/PASSWORD, POSTGRES_USER/PASSWORD
+# 2. Khởi động toàn bộ stack
+docker compose up -d
 
-# 3. Khởi động tất cả services
-docker-compose up -d
+# 3. Chờ services healthy (~3-5 phút)
+docker compose ps  # tất cả "healthy"
 
-# 4. Chờ services healthy (~2-3 phút)
-docker-compose ps
+# 4. Khởi tạo dữ liệu lịch sử InfluxDB (90 ngày)
+docker compose run --rm influx-backfill python /app/backfill_historical.py --mode populate --days 90
+# Chạy khoảng 30-60 phút cho 400 symbols × 90 ngày
 
 # 5. Submit Flink job
-docker exec flink-jobmanager flink run -d -py /app/src/ingest_flink_crypto.py
+docker exec flink-jobmanager flink run \
+  --python /app/src/ingest_flink_crypto.py \
+  --pyFiles /app/src -d
+
+# 6. Verify frontend
+# Truy cập http://localhost → chart phải hiển thị dữ liệu real-time
 ```
 
-### 9.3. Thiết lập retention InfluxDB
-
-```powershell
-# Windows
-.\scripts\setup_influx_retention.ps1
-
-# Linux/Mac
-./scripts/setup_influx_retention.sh
-```
-
-### 9.4. Backfill dữ liệu
+### Rebuild sau khi sửa code
 
 ```bash
-# Populate 90 ngày 1m candles
-docker run --rm --network cryptoprice_crypto-net \
-  -e INFLUX_URL=http://influxdb:8086 \
-  -e INFLUX_TOKEN=<your-token> \
-  -e INFLUX_ORG=vi \
-  -e INFLUX_BUCKET=crypto \
-  cryptoprice-influx-backfill \
-  python /app/backfill_historical.py --mode populate --days 90
+# FastAPI (serving/ thay đổi)
+docker compose up -d --build fastapi
+
+# Frontend (frontend/ thay đổi)
+docker compose up -d --build nginx
+
+# Flink job (src/ thay đổi) — không cần rebuild image vì volume mount
+JOB_ID=$(docker exec flink-jobmanager flink list | grep RUNNING | awk '{print $4}')
+docker exec flink-jobmanager flink cancel $JOB_ID
+docker exec flink-jobmanager flink run --python /app/src/ingest_flink_crypto.py --pyFiles /app/src -d
+
+# Producer (producer/ thay đổi)
+docker compose up -d --build producer
 ```
 
-### 9.5. Truy cập UI
+### Port reference
 
-| Service | URL |
-|---------|-----|
-| Frontend | http://localhost |
-| Flink UI | http://localhost:8081 |
-| Spark UI | http://localhost:8082 |
-| Trino UI | http://localhost:8083 |
-| InfluxDB | http://localhost:8086 |
-| MinIO Console | http://localhost:9001 |
-| Dagster UI | http://localhost:3000 |
+| Service | External Port | URL |
+|---|---|---|
+| Frontend (Nginx) | 80 | http://localhost |
+| FastAPI docs | 8080 | http://localhost:8080/docs |
+| Flink Web UI | 8081 | http://localhost:8081 |
+| Spark Master UI | 8082 | http://localhost:8082 |
+| Trino UI | 8083 | http://localhost:8083 |
+| Spark History Server | 18080 | http://localhost:18080 |
+| Dagster Web UI | 3000 | http://localhost:3000 |
+| InfluxDB UI | 8086 | http://localhost:8086 |
+| MinIO Console | 9001 | http://localhost:9001 |
+| Schema Registry | 8085 | http://localhost:8085 |
+| KeyDB | 6379 | keydb:6379 (internal) |
+| Kafka | 9092 | kafka:9092 (internal) |
+| PostgreSQL | 5432 | postgres:5432 (internal) |
 
----
-
-## 10. Xử lý sự cố
-
-### 10.1. Lỗi thường gặp
-
-| Lỗi | Nguyên nhân | Giải pháp |
-|-----|-------------|-----------|
-| **Cannot access 'q' before initialization** | TDZ trong JavaScript | Di chuyển function declaration lên trước useEffect |
-| **Candles 1m+ không load** | Thiếu INFLUX_ORG/INFLUX_BUCKET | Thêm vào .env, restart fastapi |
-| **Chart flickering** | Full-reload khi polling | Dùng incremental `.update()` thay vì `setData()` |
-| **Scroll-left reset chart** | maxBars=500 truncate, useState cascade | Tăng maxBars=10000, dùng useRef cho isLoadingMore |
-| **WebSocket reconnect loop** | Binance rate limit | Giảm số connections, tăng heartbeat interval |
-
-### 10.2. Kiểm tra logs
+### Kiểm tra health
 
 ```bash
-# Producer logs
-docker logs -f producer
+# Tất cả containers
+docker compose ps
 
-# Flink logs
-docker logs -f flink-taskmanager
-
-# FastAPI logs
-docker logs -f fastapi
-
-# Nginx logs
-docker logs -f nginx
-```
-
-### 10.3. Reset dữ liệu
-
-```bash
-# Xóa tất cả volumes (CẢNH BÁO: mất toàn bộ dữ liệu)
-docker-compose down -v
-
-# Khởi động lại
-docker-compose up -d
-```
-
-### 10.4. Kiểm tra Flink job
-
-```bash
-# List running jobs
+# Flink job đang chạy
 docker exec flink-jobmanager flink list
 
-# Cancel job
-docker exec flink-jobmanager flink cancel <job-id>
+# KeyDB
+docker exec keydb keydb-cli ping  # PONG
 
-# Resubmit job
-docker exec flink-jobmanager flink run -d -py /app/src/ingest_flink_crypto.py
+# InfluxDB (số candles BTCUSDT)
+docker exec influxdb influx query \
+  'from(bucket:"crypto") |> range(start:-1d) |> filter(fn:(r)=>r.symbol=="BTCUSDT" and r.interval=="1m") |> count()' \
+  -o vi --token $INFLUX_TOKEN
+
+# FastAPI health
+curl http://localhost:8080/api/health
+```
+
+### Xem logs
+
+```bash
+# FastAPI logs
+docker compose logs -f fastapi
+
+# Flink TaskManager real-time logs
+docker compose logs -f flink-taskmanager | grep -v "heartbeat"
+
+# Producer logs (confirm Kafka write)
+docker compose logs -f producer
+
+# Dagster run logs
+# → Dagster UI: http://localhost:3000 → Runs
 ```
 
 ---
 
-## Phụ lục
+## 16. Các vấn đề đã gặp và cách sửa
 
-### A. Biến môi trường
+### Bug 1: KeyDB ZADD tạo duplicate entries (dedup ratio 5.8x)
 
-| Biến | Mô tả | Ví dụ |
-|------|-------|-------|
-| `INFLUX_TOKEN` | InfluxDB API token | `abc123...` |
-| `INFLUX_ORG` | InfluxDB organization | `vi` |
-| `INFLUX_BUCKET` | InfluxDB bucket | `crypto` |
-| `MINIO_ROOT_USER` | MinIO access key | `minioadmin` |
-| `MINIO_ROOT_PASSWORD` | MinIO secret key | `minioadmin123` |
-| `POSTGRES_USER` | PostgreSQL username | `postgres` |
-| `POSTGRES_PASSWORD` | PostgreSQL password | `postgres123` |
+**Vấn đề:** Cùng 1 `kline_start` ghi nhiều lần (vì Flink xử lý nhiều updates của cùng giây), `ZADD` với member khác nhau tạo nhiều entries trong sorted set.
 
-### B. Kafka Topics
+**Nguyên nhân:** Sorted set dedup theo `(score, member)` pair — nếu member string khác nhau (JSON khác) thì không dedup dù cùng timestamp.
 
-| Topic | Partitions | Retention | Mô tả |
-|-------|------------|-----------|-------|
-| `crypto_ticker` | 3 | 48h | Ticker 24h data |
-| `crypto_klines` | 3 | 48h | 1s candle data |
-| `crypto_depth` | 3 | 48h | Order book depth |
+**Sửa (`KeyDBKlineWriter`):**
+```python
+# Trước mỗi ZADD: xóa entry cũ cùng score (timestamp)
+pipeline.zremrangebyscore(key, kline_start_ms, kline_start_ms)
+pipeline.zadd(key, {json_str: kline_start_ms})
+```
 
-### C. KeyDB Keys
-
-| Pattern | Type | TTL | Mô tả |
-|---------|------|-----|-------|
-| `ticker:latest:{symbol}` | Hash | — | Latest ticker |
-| `ticker:history:{symbol}` | Sorted Set | Auto-cleanup 5min | Price history |
-| `candle:1s:{symbol}` | Sorted Set | 8h | 1s candles |
-| `candle:1m:{symbol}` | Sorted Set | 7d | 1m candles |
-| `candle:latest:{symbol}` | Hash | — | Latest candle |
-| `orderbook:{symbol}` | Hash | 60s | Order book |
-| `indicator:latest:{symbol}` | Hash | — | SMA/EMA indicators |
-
-### D. InfluxDB Measurements
-
-| Measurement | Tags | Fields |
-|-------------|------|--------|
-| `market_ticks` | symbol, exchange | price, bid, ask, volume, quote_volume, trade_count |
-| `candles` | symbol, exchange, interval | open, high, low, close, volume, quote_volume, is_closed |
-| `indicators` | symbol, exchange | sma20, sma50, ema12, ema26, close |
+**Kết quả:** Dedup ratio từ 5.8x → 1.00x (không còn duplicate).
 
 ---
 
-*Cập nhật: 2026-03-11*
+### Bug 2: KlineWindowAggregator safety timer cascade
+
+**Vấn đề:** Safety timer cũ không bị cancel khi window mới bắt đầu → timer cũ fire giữa window đang chạy → emit partial candle với volume rất thấp bất thường (chỉ gom được 10-15 giây thay vì 60).
+
+**Nguyên nhân:** `flink.api.common.state.ValueState` để lưu timer timestamp bị bỏ sót, không cancel timer trước khi đăng ký timer mới.
+
+**Sửa (`KlineWindowAggregator`):**
+```python
+# Trong state: ValueState<Long> timer_ts
+# Khi đăng ký timer mới:
+if self.timer_ts.value():
+    ctx.timer_service().delete_event_time_timer(self.timer_ts.value())
+new_timer = window_start + 65000
+ctx.timer_service().register_event_time_timer(new_timer)
+self.timer_ts.update(new_timer)
+
+# Trong on_timer:
+def on_timer(self, timestamp, ctx, out):
+    if self.timer_ts.value() != timestamp:
+        return  # stale timer — ignore
+    self._flush_window(out)
+```
+
+---
+
+### Bug 3: klines.py dedup giữ partial candle
+
+**Vấn đề:** Khi merge KeyDB (newer) và InfluxDB (older), cùng timestamp xuất hiện ở cả 2 → dedup giữ random → đôi khi giữ partial candle từ Flink (volume thấp) thay vì closed candle từ InfluxDB (volume đầy đủ).
+
+**Sửa (`klines.py`):**
+```python
+# Dedup: giữ entry có volume cao nhất cho mỗi timestamp
+best_by_time = {}
+for c in all_candles:
+    t = c["openTime"]
+    if t not in best_by_time or c["volume"] > best_by_time[t]["volume"]:
+        best_by_time[t] = c
+result = sorted(best_by_time.values(), key=lambda x: x["openTime"])
+```
+
+---
+
+### Bug 4: ticker stale overwrite candle → 1m+ chart latency 18s
+
+**Vấn đề:** `ticker:latest` cập nhật qua `!ticker@arr` stream của Binance (batch 14-30s). Code cũ dùng ticker để override `close` price của candle hiện tại → chart hiển thị giá cách 18-30s trước, không phải giá live.
+
+**Sửa (`ws.py` và `klines.py`):**
+```python
+# Chỉ dùng ticker nếu event_time MỚI HƠN sub-candle mới nhất
+if ticker_event_time > latest_sub_candle_ts:
+    candle["close"] = ticker_price
+    candle["high"] = max(candle["high"], ticker_price)
+    candle["low"] = min(candle["low"], ticker_price)
+# Nếu ticker cũ hơn → giữ close từ 1s sub-candle (lag ~1-1.5s thay vì 18s)
+```
+
+---
+
+### Bug 5: scroll-left không load historical data
+
+**Vấn đề:** `_query_influx_sync()` luôn dùng `range(start: -{range_h}h)` tương đối (ví dụ `-9h`). Khi scroll đến dữ liệu 30 ngày trước, range `-9h` hoàn toàn không bao phủ → trả về 0 candles.
+
+**Sửa (`klines.py`):**
+```python
+def _query_influx_sync(symbol, interval, limit, range_h, end_ms=None):
+    if end_ms:
+        # Tính absolute range: [end_ms - buffer, end_ms]
+        stop_dt = _ms_to_rfc3339(end_ms + 1000)
+        start_ms = end_ms - limit * _interval_to_seconds(interval) * 1000 * 1.5
+        start_dt = _ms_to_rfc3339(int(start_ms))
+        range_clause = f'range(start: {start_dt}, stop: {stop_dt})'
+    else:
+        range_clause = f'range(start: -{range_h}h)'
+```
+
+---
+
+### Bug 6: 1m chart flickering (nhấp nháy candle cuối)
+
+**Vấn đề:** WS (`ws.py`) build candle từ 1s sub-candles → OHLCV chính xác (ví dụ volume=1.23). REST poll (`klines.py`) build in-progress candle từ ticker only → `{O=H=L=C=ticker, volume=0}`. Frontend nhận WS candle rồi 0.5s sau overwrite bởi REST candle khác giá trị → nhấp nháy 2 lần/giây.
+
+**Sửa 2 nơi:**
+
+1. `klines.py` — in-progress candle cũng build từ 1s sub-candles giống ws.py:
+```python
+subs = await redis.zrangebyscore(f"candle:1s:{symbol}", minute_start, "+inf")
+if subs:
+    # aggregate như ws.py
+    inprogress_candle = _aggregate_1s(subs)
+    inprogress_candle["close"] = ticker_price if ticker_newer else inprogress_close
+```
+
+2. `CandlestickChart.js` — poll skip live bar:
+```python
+if idx == candlesRef.current.length - 1 && intervalMs >= 60000:
+    continue;  // WS là authoritative cho candle đang chạy trên 1m+ chart
+```
+
+---
+
+**Ghi chú phiên bản tài liệu:**
+- Phiên bản: 2.0
+- Cập nhật lần cuối: Tháng 3 2026
+- Covers commit: `de437e6` (fix: prevent chart flickering)
