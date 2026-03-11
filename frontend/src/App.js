@@ -179,7 +179,7 @@ const TradingDashboard = () => {
   const isChartTab = chartActiveTab === "chart";
 
   return (
-    <div className="bg-gray-900 text-white min-h-screen font-sans flex flex-col">
+    <div className="bg-gray-900 text-white h-screen font-sans flex flex-col overflow-hidden">
       <Header showNavDrawer={showNavDrawer} onToggleDrawer={setShowNavDrawer} />
 
       {connError && (

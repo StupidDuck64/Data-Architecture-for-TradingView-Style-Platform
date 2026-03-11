@@ -95,7 +95,7 @@ def backfill_historical(context: AssetExecutionContext) -> None:
     description=(
         "Aggregates 1-minute candles into hourly candles to reduce data bloat. "
         "Runs on both InfluxDB (candles measurement) and Iceberg (coin_klines table). "
-        "Deletes 1m data older than RETENTION_1M_DAYS (default: 7 days)."
+        "Deletes 1m data older than RETENTION_1M_DAYS (default: 90 days)."
     ),
     group_name="maintenance",
 )

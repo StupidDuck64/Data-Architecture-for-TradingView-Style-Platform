@@ -68,6 +68,10 @@ const CandlestickChart = ({
   const [retryCount, setRetryCount] = useState(0);
   const [historicalRange, setHistoricalRange] = useState(null); // { startMs, endMs } or null
   const [noData, setNoData] = useState(false);
+  const isLoadingMoreRef = useRef(false);
+  const earliestTimestampRef = useRef(null);
+  const noMoreDataRef = useRef(false);
+  const scrollCooldownRef = useRef(0);
 
   const handleSymbolChange = useCallback(
     (s) => {
@@ -222,12 +226,122 @@ const CandlestickChart = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Helper: load more historical data when scrolling left
+  const loadMoreHistoricalData = useCallback(async () => {
+    if (isLoadingMoreRef.current || noMoreDataRef.current || !candleRef.current || historicalRange) return;
+    // Cooldown: prevent rapid-fire loads
+    if (Date.now() - scrollCooldownRef.current < 500) return;
+    const current = candlesRef.current;
+    if (current.length === 0) return;
+
+    const earliestTime = current[0].time;
+    
+    isLoadingMoreRef.current = true;
+    try {
+      const limit = 500;
+      const olderData = await fetchCandles(symbol, timeframe.toLowerCase(), limit, earliestTime);
+      
+      if (olderData.length === 0) {
+        noMoreDataRef.current = true;
+        isLoadingMoreRef.current = false;
+        return;
+      }
+
+      // Filter out duplicates and merge
+      const newCandles = olderData.filter(c => c.time < earliestTime);
+      if (newCandles.length === 0) {
+        noMoreDataRef.current = true;
+        isLoadingMoreRef.current = false;
+        return;
+      }
+      const merged = [...newCandles, ...current];
+      
+      // Update refs BEFORE touching chart
+      candlesRef.current = merged;
+      earliestTimestampRef.current = merged[0].time;
+      
+      // Preserve visible range so chart doesn't jump
+      const ts = chartRef.current ? chartRef.current.timeScale() : null;
+      const visibleRange = ts ? ts.getVisibleLogicalRange() : null;
+
+      // Apply to chart series
+      candleRef.current.setData(merged);
+      if (onCandlesChange) onCandlesChange(merged);
+
+      // Restore visible range offset (older data shifts indices)
+      if (ts && visibleRange) {
+        const shift = newCandles.length;
+        ts.setVisibleLogicalRange({
+          from: visibleRange.from + shift,
+          to: visibleRange.to + shift,
+        });
+      }
+      
+      // Update volume + indicators
+      const vs = volumeRef.current;
+      if (vs) {
+        vs.setData(
+          merged.map((c) => ({
+            time: c.time,
+            value: c.volume,
+            color: c.close >= c.open ? THEME.volumeUp : THEME.volumeDown,
+          })),
+        );
+      }
+      if (sma20Ref.current)
+        sma20Ref.current.setData(calcSMA(merged, indSettings.sma20.period));
+      if (sma50Ref.current)
+        sma50Ref.current.setData(calcSMA(merged, indSettings.sma50.period));
+      if (emaRef.current)
+        emaRef.current.setData(calcEMA(merged, indSettings.ema.period));
+      if (rsiSeriesRef.current)
+        rsiSeriesRef.current.setData(calcRSI(merged, indSettings.rsi.period));
+      if (mfiSeriesRef.current)
+        mfiSeriesRef.current.setData(calcMFI(merged, indSettings.mfi.period));
+
+      // Update React state last (avoid triggering re-renders mid-update)
+      setCandles(merged);
+      scrollCooldownRef.current = Date.now();
+      isLoadingMoreRef.current = false;
+    } catch (error) {
+      console.error('Failed to load more historical data:', error);
+      isLoadingMoreRef.current = false;
+    }
+  }, [symbol, timeframe, historicalRange, indSettings, onCandlesChange]);
+
+  // Subscribe to scroll/zoom events to load more historical data
+  useEffect(() => {
+    if (!chartRef.current || historicalRange) return;
+    
+    const timeScale = chartRef.current.timeScale();
+    const handleVisibleRangeChange = () => {
+      const logicalRange = timeScale.getVisibleLogicalRange();
+      if (!logicalRange) return;
+      
+      // If user scrolls close to the left edge, load more data
+      if (logicalRange.from < 20) {
+        loadMoreHistoricalData();
+      }
+    };
+    
+    const unsubscribe = timeScale.subscribeVisibleLogicalRangeChange(handleVisibleRangeChange);
+    
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [loadMoreHistoricalData, historicalRange]);
+
   // Helper: push OHLCV data into chart series + indicators
   const applyDataToChart = useCallback(
     (data) => {
       if (!candleRef.current) return;
       setCandles(data);
       candlesRef.current = data;
+      if (data.length > 0) {
+        earliestTimestampRef.current = data[0].time;
+        noMoreDataRef.current = false;
+        scrollCooldownRef.current = 0;
+      }
       if (onCandlesChange) onCandlesChange(data);
       setNoData(data.length === 0);
       candleRef.current.setData(data);
@@ -272,7 +386,7 @@ const CandlestickChart = ({
     }
 
     const limit = is1s ? 120 : 200;
-    const maxBars = is1s ? 120 : 500;
+    const maxBars = is1s ? 120 : 10000;
 
     // Full load — fetches candles, rebuilds all series + indicators
     const loadData = () => {
@@ -366,13 +480,71 @@ const CandlestickChart = ({
       },
     );
 
-    // For 1m+ re-fetch every 30s so indicators stay in sync.
-    // For 1s skip the full poll — the WS stream is the source of truth.
-    const fullPollId = is1s ? null : setInterval(loadData, 30000);
+    // Incremental poll: fetch only the last few candles and merge
+    // instead of full-reload which causes chart flickering.
+    const pollIncremental = () => {
+      if (cancelled || !candleRef.current) return;
+      const fetchLimit = is1s ? 5 : 3;
+      fetchCandles(symbol, timeframe.toLowerCase(), fetchLimit)
+        .then((data) => {
+          if (cancelled || !candleRef.current || data.length === 0) return;
+          const prev = candlesRef.current;
+          if (prev.length === 0) {
+            // No data yet, do a full load
+            applyDataToChart(data);
+            return;
+          }
+          let changed = false;
+          for (const c of data) {
+            const existIdx = prev.findIndex((p) => p.time === c.time);
+            if (existIdx >= 0) {
+              const old = prev[existIdx];
+              if (old.close !== c.close || old.high !== c.high || old.low !== c.low || old.volume !== c.volume) {
+                prev[existIdx] = c;
+                candleRef.current.update(c);
+                if (volumeRef.current) {
+                  volumeRef.current.update({
+                    time: c.time,
+                    value: c.volume,
+                    color: c.close >= c.open ? THEME.volumeUp : THEME.volumeDown,
+                  });
+                }
+                changed = true;
+              }
+            } else if (c.time > prev[prev.length - 1].time) {
+              if (is1s) {
+                prev.push(c);
+                while (prev.length > maxBars) prev.shift();
+              } else {
+                prev.push(c);
+                while (prev.length > maxBars) prev.shift();
+              }
+              candleRef.current.update(c);
+              if (volumeRef.current) {
+                volumeRef.current.update({
+                  time: c.time,
+                  value: c.volume,
+                  color: c.close >= c.open ? THEME.volumeUp : THEME.volumeDown,
+                });
+              }
+              changed = true;
+            }
+          }
+          if (changed) {
+            candlesRef.current = [...prev];
+            setCandles([...prev]);
+            if (onCandlesChange) onCandlesChange([...prev]);
+          }
+        })
+        .catch(() => {});
+    };
+
+    const pollInterval = 1000;
+    const pollId = setInterval(pollIncremental, pollInterval);
 
     return () => {
       cancelled = true;
-      if (fullPollId) clearInterval(fullPollId);
+      if (pollId) clearInterval(pollId);
       if (unsub) unsub();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

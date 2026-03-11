@@ -190,7 +190,7 @@ services:
     restart: unless-stopped
     ports:
       - "6379:6379"
-    command: keydb-server --save 60 1 --loglevel warning --maxmemory 1gb --maxmemory-policy allkeys-lru --hz 50 --tcp-backlog 511
+    command: keydb-server --save 60 1 --loglevel warning --maxmemory 2560mb --maxmemory-policy allkeys-lru --hz 50 --tcp-backlog 511
     volumes:
       - keydb-data:/data
     networks:
@@ -303,6 +303,7 @@ services:
       INFLUX_TOKEN: ${INFLUX_TOKEN}
       INFLUX_ORG: ${INFLUX_ORG}
       INFLUX_BUCKET: ${INFLUX_BUCKET}
+      RETENTION_1M_DAYS: 90
     volumes:
       - ./:/app
       - spark-events:/opt/spark-events
@@ -427,6 +428,7 @@ services:
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      RETENTION_1M_DAYS: 90
     volumes:
       - ./:/app
       - dagster-home:/dagster-home

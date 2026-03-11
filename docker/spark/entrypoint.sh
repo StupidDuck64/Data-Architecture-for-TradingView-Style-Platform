@@ -24,7 +24,7 @@ case "${SPARK_MODE:-master}" in
     [ -n "${SPARK_WORKER_MEMORY}" ]   && WORKER_ARGS="$WORKER_ARGS --memory ${SPARK_WORKER_MEMORY}"
     [ -n "${SPARK_WORKER_CORES}" ]    && WORKER_ARGS="$WORKER_ARGS --cores ${SPARK_WORKER_CORES}"
     [ -n "${SPARK_WORKER_WEBUI_PORT}" ] && WORKER_ARGS="$WORKER_ARGS --webui-port ${SPARK_WORKER_WEBUI_PORT}"
-    echo "Starting Spark Worker â†’ $MASTER_URL"
+    echo "Starting Spark Worker ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ $MASTER_URL"
     exec "$SPARK_HOME/bin/spark-class" org.apache.spark.deploy.worker.Worker \
       $WORKER_ARGS "$MASTER_URL"
     ;;

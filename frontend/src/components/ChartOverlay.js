@@ -270,7 +270,7 @@ const ChartOverlay = ({ activeTool, drawings, onAddDrawing, toolSettings, candle
       }
       case 'rectangle': {
         const color = s.color || '#8b5cf6';
-        const hexToRgb = (h) => { const r = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h); return r ? [parseInt(r[1],16),parseInt(r[2],16),parseInt(r[3],16)] : [139,92,246]; };
+        const hexToRgb = (h) => { const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h); return m ? [parseInt(m[1],16),parseInt(m[2],16),parseInt(m[3],16)] : [139,92,246]; };
         const [r,g,b] = hexToRgb(color);
         return (
           <g key={key} opacity={opacity}>

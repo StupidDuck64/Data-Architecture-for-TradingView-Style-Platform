@@ -109,14 +109,17 @@ function generateMockCandles(symbol, timeframeKey, count = 200) {
  * @param {string} symbol      e.g. 'BTCUSDT'
  * @param {string} timeframe   key of TIMEFRAMES, e.g. '1h'
  * @param {number} [limit=200] number of candles
+ * @param {number} [endTime]   optional end timestamp in seconds (exclusive). When provided, fetches candles before this time.
  * @returns {Promise<Array>}   array of { time, open, high, low, close, volume }
  */
-export async function fetchCandles(symbol, timeframe = "1h", limit = 200) {
+export async function fetchCandles(symbol, timeframe = "1h", limit = 200, endTime = null) {
   if (DATA_SOURCE === "api") {
-    const res = await fetch(
-      `${API_BASE_URL}/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${limit}`,
-      { headers: { "Content-Type": "application/json" } },
-    );
+    let url = `${API_BASE_URL}/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${limit}`;
+    if (endTime) {
+      // Convert seconds to milliseconds for backend API
+      url += `&endTime=${endTime * 1000}`;
+    }
+    const res = await fetch(url, { headers: { "Content-Type": "application/json" } });
     if (!res.ok) throw new Error(`API error ${res.status}`);
     const raw = await res.json();
     // Adapt this mapping to match your backend response shape:

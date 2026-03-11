@@ -99,6 +99,7 @@ async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict |
 
     flink_candle = None
     flink_window = 0
+    latest_source_ts = 0  # newest timestamp from source candle data
     if latest:
         latest_score = int(latest[0][1])
         flink_window = (latest_score // target_ms) * target_ms
@@ -107,6 +108,7 @@ async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict |
         )
         if raw:
             candles = [json.loads(c) for c in raw]
+            latest_source_ts = max(int(c["t"]) for c in candles)
             flink_candle = {
                 "openTime": flink_window,
                 "open": candles[0]["o"],
@@ -116,14 +118,15 @@ async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict |
                 "volume": round(sum(c["v"] for c in candles), 8),
             }
 
-    # Merge with real-time ticker
+    # Merge with real-time ticker — only if ticker is NEWER than source data
     if live_price and live_ts:
         live_window = (live_ts // target_ms) * target_ms
         if flink_candle and live_window == flink_window:
-            # Same window → update close / extend high-low from ticker
-            flink_candle["close"] = live_price
-            flink_candle["high"] = max(flink_candle["high"], live_price)
-            flink_candle["low"] = min(flink_candle["low"], live_price)
+            # Same window — only update if ticker is fresher than source candles
+            if live_ts > latest_source_ts:
+                flink_candle["close"] = live_price
+                flink_candle["high"] = max(flink_candle["high"], live_price)
+                flink_candle["low"] = min(flink_candle["low"], live_price)
             return flink_candle
         if live_window > flink_window:
             # Ticker is in a newer window → synthesise a candle from ticker price
