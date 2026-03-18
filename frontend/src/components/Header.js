@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from "react";
 import { Search, Menu, X } from "lucide-react";
 import LanguageSwitcher from "./LanguageSwitcher";
+import SystemHealthCard from "./SystemHealthCard";
 import { useI18n } from "../i18n";
 
 const NAV_ITEMS_KEYS = ["products", "community", "markets", "news", "brokers"];
@@ -24,7 +25,10 @@ const Header = ({ showNavDrawer, onToggleDrawer }) => {
     <>
       <header className="bg-gray-800 p-4 flex items-center justify-between">
         <div className="flex items-center space-x-4">
-          <span className="text-2xl font-bold text-blue-500">LMView</span>
+          <div className="flex items-center gap-2">
+            <span className="text-2xl font-bold text-blue-500">LMView</span>
+            <SystemHealthCard />
+          </div>
         </div>
         <div className="flex items-center space-x-3">
           <div className="relative">

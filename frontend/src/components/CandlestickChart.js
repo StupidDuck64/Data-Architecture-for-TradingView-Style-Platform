@@ -586,45 +586,14 @@ const CandlestickChart = ({
       2000,
       interval,
     )
-      .then(async (data) => {
+      .then((data) => {
         if (cancelled) return;
 
-        if (data.length > 0) {
-          applyDataToChart(data);
-          setIsLoading(false);
-          return;
-        }
-
-        // If low-timeframe cold data is unavailable for this symbol/range,
-        // gracefully fall back to 1H so historical mode still renders.
-        if (["1m", "5m", "15m"].includes(interval)) {
-          try {
-            const fallback = await fetchHistoricalCandles(
-              symbol,
-              historicalRange.startMs,
-              historicalRange.endMs,
-              2000,
-              "1h",
-            );
-            if (cancelled) return;
-
-            if (fallback.length > 0) {
-              applyDataToChart(fallback);
-              if (timeframe !== "1H") {
-                setTimeframe("1H");
-              }
-              setFetchError(null);
-              setIsLoading(false);
-              return;
-            }
-          } catch (_) {
-            // Fall through to unified no-data message.
-          }
-        }
-
-        applyDataToChart([]);
+        applyDataToChart(data);
         setIsLoading(false);
-        setFetchError("No historical data for this range");
+        if (data.length === 0) {
+          setFetchError("No historical data for this range");
+        }
       })
       .catch(() => {
         if (cancelled) return;

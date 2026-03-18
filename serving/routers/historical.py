@@ -1,10 +1,13 @@
 import asyncio
+import os
 import re
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 
-from serving.connections import get_trino_connection
+from serving.config import INFLUX_BUCKET
+from serving.connections import get_influx, get_trino_connection
 
 router = APIRouter(prefix="/api", tags=["historical"])
 
@@ -22,6 +25,7 @@ INTERVAL_SECONDS = {
 
 MAX_RAW_ROWS = 200_000
 HOURLY_INTERVALS = {"1h", "4h", "1d", "1w"}
+INFLUX_1M_RETENTION_DAYS = int(os.environ.get("INFLUX_1M_RETENTION_DAYS", "90"))
 
 
 def _validate(symbol: str) -> str:
@@ -43,6 +47,19 @@ def _to_candle_rows(rows: list[tuple]) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def _merge_unique(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    if not incoming:
+        return existing
+    merged: dict[int, dict] = {int(c["openTime"]): c for c in existing}
+    for c in incoming:
+        merged[int(c["openTime"])] = c
+    return sorted(merged.values(), key=lambda x: x["openTime"])
+
+
+def _ms_to_rfc3339(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _aggregate(candles: list[dict], target_ms: int) -> list[dict]:
@@ -132,6 +149,36 @@ def _query_trino_historical(
         conn.close()
 
 
+def _query_influx_1m_range(
+    symbol: str, start_ms: int, end_ms: int, limit: int,
+) -> list[dict]:
+    start_rfc = _ms_to_rfc3339(start_ms)
+    stop_rfc = _ms_to_rfc3339(end_ms)
+    query = f'''
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: {start_rfc}, stop: {stop_rfc})
+  |> filter(fn: (r) => r._measurement == "candles")
+  |> filter(fn: (r) => r.symbol == "{symbol}")
+  |> filter(fn: (r) => r.interval == "1m")
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+  |> tail(n: {limit})
+'''
+    tables = get_influx().query_api().query(query)
+    out: list[dict] = []
+    for table in tables:
+        for rec in table.records:
+            out.append({
+                "openTime": int(rec.get_time().timestamp() * 1000),
+                "open": float(rec.values.get("open", 0)),
+                "high": float(rec.values.get("high", 0)),
+                "low": float(rec.values.get("low", 0)),
+                "close": float(rec.values.get("close", 0)),
+                "volume": float(rec.values.get("volume", 0)),
+            })
+    return out
+
+
 @router.get("/klines/historical")
 async def get_historical_klines(
     symbol: str,
@@ -162,40 +209,51 @@ async def get_historical_klines(
     if endTime - startTime > max_range_ms:
         raise HTTPException(400, "Date range cannot exceed 1 year")
 
-    # Query 1m base candles from coin_klines and aggregate server-side.
-    # For very large 1h+ ranges, prefer hourly source to avoid over-fetching 1m.
-    range_ms = endTime - startTime
-    max_1m_span_ms = MAX_RAW_ROWS * 60 * 1000
-    use_hourly_first = interval in HOURLY_INTERVALS and range_ms > max_1m_span_ms
-
+    # Query 1m base candles from hot (Influx) and cold (Iceberg) layers.
+    # This keeps small/recent ranges responsive while still supporting deep history.
     mult = max(target_sec // 60, 1)
     raw_limit = min((limit * mult) + mult, MAX_RAW_ROWS)
-    if (not use_hourly_first) and raw_limit >= MAX_RAW_ROWS and limit * mult > MAX_RAW_ROWS:
-        raise HTTPException(400, "Requested range/limit is too large for this interval")
+    candles: list[dict] = []
 
-    candles = []
-    if not use_hourly_first:
+    now_ms = int(time.time() * 1000)
+    influx_cutoff_ms = now_ms - (INFLUX_1M_RETENTION_DAYS * 24 * 3600 * 1000)
+
+    # Recent overlap -> Influx 1m
+    influx_start = max(startTime, influx_cutoff_ms)
+    influx_end = endTime
+    if influx_end > influx_start:
         try:
-            candles = await asyncio.to_thread(
-                _query_trino_1m, symbol, startTime, endTime, raw_limit,
+            influx_rows = await asyncio.to_thread(
+                _query_influx_1m_range, symbol, influx_start, influx_end, raw_limit,
             )
+            candles = _merge_unique(candles, influx_rows)
         except Exception:
             pass
 
-    # Fallback to legacy historical_hourly data if 1m table is unavailable,
-    # sparse, or range is too large for efficient 1m retrieval.
-    if use_hourly_first or not candles:
-        candles = await asyncio.to_thread(
-            _query_trino_historical, symbol, startTime, endTime, limit,
-        )
-        # historical_hourly only has 1h granularity; do not fabricate 1m/5m/15m.
+    # Older overlap -> Iceberg 1m
+    trino_start = startTime
+    trino_end = min(endTime, influx_cutoff_ms)
+    if trino_end > trino_start:
+        try:
+            trino_rows = await asyncio.to_thread(
+                _query_trino_1m, symbol, trino_start, trino_end, raw_limit,
+            )
+            candles = _merge_unique(candles, trino_rows)
+        except Exception:
+            pass
+
+    # If no 1m base rows are available, fallback to hourly cold table for 1h+.
+    if not candles:
         if interval in ("1m", "5m", "15m"):
             return []
-        # historical_hourly is already hourly; only aggregate for 4h/1d/1w.
+        hourly_limit = min(max(limit * max(target_sec // 3600, 1), limit), 5000)
+        candles = await asyncio.to_thread(
+            _query_trino_historical, symbol, startTime, endTime, hourly_limit,
+        )
         if candles and interval in ("4h", "1d", "1w"):
             candles = _aggregate(candles, target_sec * 1000)
-            candles = candles[-limit:]
-        return candles
+        candles = [c for c in candles if startTime <= c["openTime"] < endTime]
+        return candles[-limit:]
 
     if interval != "1m":
         candles = _aggregate(candles, target_sec * 1000)

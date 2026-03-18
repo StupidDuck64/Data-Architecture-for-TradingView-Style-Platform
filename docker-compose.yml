@@ -357,6 +357,30 @@ services:
     depends_on:
       - spark-master
 
+  auto-submit-jobs:
+    image: docker:27.0-cli
+    container_name: auto-submit-jobs
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        apk add --no-cache bash curl >/dev/null && \
+        bash /app/scripts/auto_submit_jobs.sh
+    environment:
+      FLINK_HEALTH_URL: http://flink-jobmanager:8081
+      SPARK_HEALTH_URL: http://spark-master:8080
+    volumes:
+      - ./:/app:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - crypto-net
+    depends_on:
+      flink-jobmanager:
+        condition: service_started
+      spark-master:
+        condition: service_started
+
   # ══════════════════════════════════════════════════════════════════════════════
   # QUERY + ORCHESTRATION LAYER
   # ══════════════════════════════════════════════════════════════════════════════

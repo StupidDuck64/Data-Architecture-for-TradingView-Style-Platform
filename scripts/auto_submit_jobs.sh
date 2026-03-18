@@ -1,11 +1,14 @@
 #!/bin/bash
 
+FLINK_HEALTH_URL="${FLINK_HEALTH_URL:-http://127.0.0.1:8081}"
+SPARK_HEALTH_URL="${SPARK_HEALTH_URL:-http://127.0.0.1:8080}"
+
 # ==========================================
 # 1. START FLINK
 # ==========================================
 echo "Waiting for Flink Cluster to be ready on port 8081..."
 # curl -s hides output; loop exits once the endpoint is reachable
-until curl -s http://127.0.0.1:8081 > /dev/null; do
+until curl -s "$FLINK_HEALTH_URL" > /dev/null; do
     printf '.'
     sleep 5
 done
@@ -24,7 +27,7 @@ echo "Submitted Flink job."
 # ==========================================
 echo "Waiting for Spark Master to be ready on port 8080..."
 # curl -s checks Spark master endpoint availability
-until curl -s http://127.0.0.1:8080 > /dev/null; do
+until curl -s "$SPARK_HEALTH_URL" > /dev/null; do
     printf '.'
     sleep 5
 done
