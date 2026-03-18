@@ -575,23 +575,66 @@ const CandlestickChart = ({
   // Load historical data from Iceberg when date range is set
   useEffect(() => {
     if (!candleRef.current || !historicalRange) return;
+    let cancelled = false;
     setIsLoading(true);
     setFetchError(null);
+    const interval = timeframe.toLowerCase();
     fetchHistoricalCandles(
       symbol,
       historicalRange.startMs,
       historicalRange.endMs,
       2000,
-      timeframe.toLowerCase(),
+      interval,
     )
-      .then((data) => {
-        applyDataToChart(data);
+      .then(async (data) => {
+        if (cancelled) return;
+
+        if (data.length > 0) {
+          applyDataToChart(data);
+          setIsLoading(false);
+          return;
+        }
+
+        // If low-timeframe cold data is unavailable for this symbol/range,
+        // gracefully fall back to 1H so historical mode still renders.
+        if (["1m", "5m", "15m"].includes(interval)) {
+          try {
+            const fallback = await fetchHistoricalCandles(
+              symbol,
+              historicalRange.startMs,
+              historicalRange.endMs,
+              2000,
+              "1h",
+            );
+            if (cancelled) return;
+
+            if (fallback.length > 0) {
+              applyDataToChart(fallback);
+              if (timeframe !== "1H") {
+                setTimeframe("1H");
+              }
+              setFetchError(null);
+              setIsLoading(false);
+              return;
+            }
+          } catch (_) {
+            // Fall through to unified no-data message.
+          }
+        }
+
+        applyDataToChart([]);
         setIsLoading(false);
+        setFetchError("No historical data for this range");
       })
       .catch(() => {
+        if (cancelled) return;
         setIsLoading(false);
         setFetchError("Failed to load historical data");
       });
+
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, historicalRange, timeframe, retryCount]);
 

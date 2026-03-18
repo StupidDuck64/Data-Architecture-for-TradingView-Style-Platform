@@ -21,6 +21,7 @@ INTERVAL_SECONDS = {
 }
 
 MAX_RAW_ROWS = 200_000
+HOURLY_INTERVALS = {"1h", "4h", "1d", "1w"}
 
 
 def _validate(symbol: str) -> str:
@@ -71,7 +72,12 @@ def _aggregate(candles: list[dict], target_ms: int) -> list[dict]:
 def _query_trino_1m(
     symbol: str, start_ms: int, end_ms: int, limit: int,
 ) -> list[dict]:
-    """Query coin_klines 1m candles via Trino for a date range."""
+    """Query coin_klines 1m candles via Trino for a date range.
+
+    Rows are fetched from the right edge of the range (DESC + LIMIT) so when
+    the requested window is huge, the API still returns the most relevant
+    recent segment for chart rendering.
+    """
     conn = get_trino_connection()
     try:
         cur = conn.cursor()
@@ -86,12 +92,14 @@ def _query_trino_1m(
               AND is_closed = true
               AND kline_start >= ?
               AND kline_start < ?
-            ORDER BY kline_start
+            ORDER BY kline_start DESC
             LIMIT ?
             """,
             (symbol, start_ms, end_ms, limit),
         )
-        return _to_candle_rows(cur.fetchall())
+        rows = cur.fetchall()
+        rows.reverse()
+        return _to_candle_rows(rows)
     finally:
         conn.close()
 
@@ -112,12 +120,14 @@ def _query_trino_historical(
             WHERE symbol = ?
               AND open_time >= ?
               AND open_time < ?
-            ORDER BY open_time
+            ORDER BY open_time DESC
             LIMIT ?
             """,
             (symbol, start_ms, end_ms, limit),
         )
-        return _to_candle_rows(cur.fetchall())
+        rows = cur.fetchall()
+        rows.reverse()
+        return _to_candle_rows(rows)
     finally:
         conn.close()
 
@@ -153,21 +163,28 @@ async def get_historical_klines(
         raise HTTPException(400, "Date range cannot exceed 1 year")
 
     # Query 1m base candles from coin_klines and aggregate server-side.
+    # For very large 1h+ ranges, prefer hourly source to avoid over-fetching 1m.
+    range_ms = endTime - startTime
+    max_1m_span_ms = MAX_RAW_ROWS * 60 * 1000
+    use_hourly_first = interval in HOURLY_INTERVALS and range_ms > max_1m_span_ms
+
     mult = max(target_sec // 60, 1)
     raw_limit = min((limit * mult) + mult, MAX_RAW_ROWS)
-    if raw_limit >= MAX_RAW_ROWS and limit * mult > MAX_RAW_ROWS:
+    if (not use_hourly_first) and raw_limit >= MAX_RAW_ROWS and limit * mult > MAX_RAW_ROWS:
         raise HTTPException(400, "Requested range/limit is too large for this interval")
 
     candles = []
-    try:
-        candles = await asyncio.to_thread(
-            _query_trino_1m, symbol, startTime, endTime, raw_limit,
-        )
-    except Exception:
-        pass
+    if not use_hourly_first:
+        try:
+            candles = await asyncio.to_thread(
+                _query_trino_1m, symbol, startTime, endTime, raw_limit,
+            )
+        except Exception:
+            pass
 
-    # Fallback to legacy historical_hourly data if 1m table is unavailable.
-    if not candles:
+    # Fallback to legacy historical_hourly data if 1m table is unavailable,
+    # sparse, or range is too large for efficient 1m retrieval.
+    if use_hourly_first or not candles:
         candles = await asyncio.to_thread(
             _query_trino_historical, symbol, startTime, endTime, limit,
         )
