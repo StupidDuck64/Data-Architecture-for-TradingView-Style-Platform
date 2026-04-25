@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 """
-backfill_historical.py
-──────────────────────
 Unified backfill, populate & historical import script.
-Gộp chức năng của backfill_influx.py + ingest_historical_iceberg.py + initial_populate_influx.py.
 
-Mode:
-    --mode influx       : Detect + fill InfluxDB gaps (tắt máy → mất data)
+Modes:
+    --mode influx       : Detect + fill InfluxDB gaps (machine downtime → missing data)
     --mode iceberg      : Pull historical 1m klines from Binance → Iceberg
-  --mode populate     : Force populate N ngày 1m candles cho tất cả symbols (lần đầu khởi động)
-  --mode all          : Chạy influx + iceberg (không bao gồm populate)
+    --mode populate     : Force populate N days of 1m candles for all symbols (first startup)
+    --mode all          : influx + iceberg (default, does not include populate)
 
 Iceberg sub-modes:
-  --iceberg-mode backfill     : Kéo từ 2017 → nay (chạy 1 lần đầu)
-  --iceberg-mode incremental  : Chỉ kéo từ nến cuối đã lưu → nay (chạy hàng ngày)
+    --iceberg-mode backfill     : Pull from 2017 → now (run once, first time)
+    --iceberg-mode incremental  : Pull from last saved candle → now (daily scheduled)
 
-Ví dụ:
-  # Dagster scheduled:
-  python backfill_historical.py --mode all --iceberg-mode incremental
+Examples:
+    # Dagster scheduled:
+    python backfill.py --mode all --iceberg-mode incremental
 
-  # Lần đầu khởi động — populate 90 ngày cho 400 symbols:
-  python backfill_historical.py --mode populate --days 90
+    # First startup — populate 90 days for 400 symbols:
+    python backfill.py --mode populate --days 90
 
-  # Chỉ fill gap InfluxDB:
-  python backfill_historical.py --mode influx
-
-  # Chỉ kéo lịch sử Iceberg:
-  python backfill_historical.py --mode iceberg --iceberg-mode backfill --symbols BTCUSDT ETHUSDT
+    # Fill InfluxDB gaps only:
+    python backfill.py --mode influx
 """
 
 from __future__ import annotations
@@ -34,172 +28,48 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import requests
 
-# ─── Shared Config ───────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-BINANCE_KLINES_URL     = "https://api.binance.com/api/v3/klines"
-BINANCE_EXCHANGE_INFO  = "https://api.binance.com/api/v3/exchangeInfo"
-BINANCE_EPOCH_MS       = int(datetime(2017, 7, 14, tzinfo=timezone.utc).timestamp() * 1000)
-
-MAX_RETRIES    = 5
-REQUEST_DELAY  = 0.12
-
-# InfluxDB config
-INFLUX_URL     = os.environ.get("INFLUX_URL",    "http://influxdb:8086")
-INFLUX_TOKEN   = os.environ.get("INFLUX_TOKEN",  "")
-INFLUX_ORG     = os.environ.get("INFLUX_ORG",    "vi")
-INFLUX_BUCKET  = os.environ.get("INFLUX_BUCKET", "crypto")
-
-# InfluxDB backfill params
-KLINE_BATCH_INFLUX = 1000
-MIN_GAP_SEC        = 300
-MAX_BACKFILL_DAYS  = 7
-MAX_WORKERS        = 5
-
-# Iceberg / Spark config
-MINIO_ENDPOINT   = os.environ.get("MINIO_ENDPOINT",   "http://minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
-MINIO_BUCKET     = "cryptoprice"
-
-ICEBERG_CATALOG  = "iceberg_catalog"
-ICEBERG_DB       = "crypto_lakehouse"
-ICEBERG_TABLE    = "coin_klines"
-FULL_TABLE_NAME  = f"{ICEBERG_CATALOG}.{ICEBERG_DB}.{ICEBERG_TABLE}"
-
-KLINES_PER_REQ   = 1000
-FLUSH_THRESHOLD  = 10_000
-BACKFILL_SPARK_CORES_MAX = os.environ.get("BACKFILL_SPARK_CORES_MAX", "2")
-BACKFILL_SPARK_SHUFFLE_PARTITIONS = os.environ.get("BACKFILL_SPARK_SHUFFLE_PARTITIONS", "8")
-BACKFILL_FLUSH_THRESHOLD = int(os.environ.get("BACKFILL_FLUSH_THRESHOLD", str(FLUSH_THRESHOLD)))
+from common.config import (
+    FLUSH_THRESHOLD,
+    ICEBERG_CATALOG,
+    ICEBERG_DB,
+    ICEBERG_TABLE_KLINES,
+    INFLUX_BUCKET,
+    INFLUX_ORG,
+    INFLUX_TOKEN,
+    INFLUX_URL,
+    KLINE_BATCH_INFLUX,
+    KLINES_PER_REQ,
+    MAX_BACKFILL_DAYS,
+    MAX_WORKERS,
+    MIN_GAP_SEC,
+    MINIO_ACCESS_KEY,
+    MINIO_ENDPOINT,
+    MINIO_SECRET_KEY,
+    BACKFILL_SPARK_CORES_MAX,
+    BACKFILL_SPARK_SHUFFLE_PARTITIONS,
+    REQUEST_DELAY,
+    MAX_RETRIES,
+)
+from exchanges.binance.client import BinanceClient
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("backfill_historical")
+log = logging.getLogger("backfill")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SHARED HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fetch_usdt_symbols() -> list[str]:
-    """Lấy tất cả USDT spot pairs đang TRADING từ Binance."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(BINANCE_EXCHANGE_INFO, timeout=15)
-            resp.raise_for_status()
-            symbols = [
-                s["symbol"]
-                for s in resp.json().get("symbols", [])
-                if s["quoteAsset"] == "USDT"
-                and s["status"] == "TRADING"
-                and s.get("isSpotTradingAllowed", False)
-            ]
-            log.info("Found %d active USDT spot pairs.", len(symbols))
-            return sorted(symbols)
-        except Exception as e:
-            log.warning("fetch_usdt_symbols attempt %d failed: %s", attempt + 1, e)
-            time.sleep(2 ** attempt)
-    raise RuntimeError("Cannot fetch symbol list from Binance after retries.")
-
-
-def fetch_klines(
-    symbol: str,
-    start_ms: int,
-    end_ms: int,
-    interval: str = "1m",
-    batch_limit: int = 1000,
-) -> list[list]:
-    """
-    Lấy klines từ Binance REST API với phân trang tự động.
-    Trả về list of [open_time, open, high, low, close, volume,
-                     close_time, quote_volume, trades, taker_buy_vol, taker_buy_quote, ignore]
-    """
-    all_klines: list[list] = []
-    current_start = start_ms
-    step_ms = 60_000 if interval == "1m" else 3_600_000
-
-    while current_start < end_ms:
-        for attempt in range(MAX_RETRIES):
-            try:
-                resp = requests.get(
-                    BINANCE_KLINES_URL,
-                    params={
-                        "symbol":    symbol,
-                        "interval":  interval,
-                        "startTime": current_start,
-                        "endTime":   end_ms,
-                        "limit":     batch_limit,
-                    },
-                    timeout=15,
-                )
-                if resp.status_code == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 60))
-                    log.warning("[%s] Rate limited. Sleeping %ds.", symbol, retry_after)
-                    time.sleep(retry_after)
-                    continue
-                resp.raise_for_status()
-                batch = resp.json()
-                break
-            except Exception as e:
-                log.warning("[%s] klines attempt %d failed: %s", symbol, attempt + 1, e)
-                time.sleep(2 ** attempt)
-        else:
-            log.error("[%s] Giving up on window starting %d.", symbol, current_start)
-            break
-
-        if not batch:
-            break
-
-        all_klines.extend(batch)
-        last_open_time = int(batch[-1][0])
-        if last_open_time <= current_start:
-            break
-        current_start = last_open_time + step_ms
-        time.sleep(REQUEST_DELAY)
-
-    return all_klines
-
-
-def fetch_first_available_1m_start(symbol: str) -> int:
-    """Return the earliest available 1m candle open time for a symbol on Binance.
-
-    If detection fails, fall back to global Binance epoch.
-    """
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(
-                BINANCE_KLINES_URL,
-                params={
-                    "symbol": symbol,
-                    "interval": "1m",
-                    "startTime": BINANCE_EPOCH_MS,
-                    "limit": 1,
-                },
-                timeout=15,
-            )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 60))
-                log.warning("[%s] Rate limited while probing first candle. Sleeping %ds.", symbol, retry_after)
-                time.sleep(retry_after)
-                continue
-            resp.raise_for_status()
-            rows = resp.json()
-            if rows:
-                return int(rows[0][0])
-            return BINANCE_EPOCH_MS
-        except Exception as e:
-            log.warning("[%s] first-candle probe attempt %d failed: %s", symbol, attempt + 1, e)
-            time.sleep(2 ** attempt)
-    return BINANCE_EPOCH_MS
+# ── Exchange client instance ─────────────────────────────────────────────────
+exchange = BinanceClient(max_retries=MAX_RETRIES, request_delay=REQUEST_DELAY)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -207,7 +77,7 @@ def fetch_first_available_1m_start(symbol: str) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def wait_for_influx(client, retries: int = 20, delay: float = 5.0):
-    """Đợi InfluxDB sẵn sàng."""
+    """Wait for InfluxDB to be ready."""
     for i in range(retries):
         try:
             client.ping()
@@ -220,13 +90,11 @@ def wait_for_influx(client, retries: int = 20, delay: float = 5.0):
 
 
 def find_all_gaps(client) -> dict[str, list[tuple[int, int]]]:
-    """
-    Tìm tất cả khoảng trống > MIN_GAP_SEC trong time series mỗi symbol.
-    Dùng elapsed() để detect gap ở BẤT KỲ đâu trong chuỗi.
-    Trả về {symbol: [(gap_start_ms, gap_end_ms), ...]}
-    """
-    from influxdb_client import InfluxDBClient
+    """Find all gaps > MIN_GAP_SEC in each symbol's time series.
 
+    Uses InfluxDB ``elapsed()`` to detect gaps anywhere in the series.
+    Returns ``{symbol: [(gap_start_ms, gap_end_ms), ...]}``.
+    """
     max_lookback_s = MAX_BACKFILL_DAYS * 24 * 3600
     min_gap_ms     = MIN_GAP_SEC * 1000
 
@@ -261,7 +129,7 @@ from(bucket: "{INFLUX_BUCKET}")
 
 
 def klines_to_influx_points(symbol: str, klines: list[list]) -> list:
-    """Chuyển Binance klines → InfluxDB Points (market_ticks schema)."""
+    """Convert Binance klines to InfluxDB Points (market_ticks schema)."""
     from influxdb_client import Point, WritePrecision
 
     points = []
@@ -296,7 +164,7 @@ def klines_to_influx_points(symbol: str, klines: list[list]) -> list:
 
 
 def backfill_symbol_influx(symbol: str, gap_start_ms: int, gap_end_ms: int, write_api) -> int:
-    """Backfill 1 gap của 1 symbol trong InfluxDB. Trả về số points đã ghi."""
+    """Backfill one gap for one symbol in InfluxDB. Returns points written."""
     gap_sec = (gap_end_ms - gap_start_ms) / 1000
     log.info(
         "[%s] Backfilling gap %.1f min: %s → %s",
@@ -305,7 +173,7 @@ def backfill_symbol_influx(symbol: str, gap_start_ms: int, gap_end_ms: int, writ
         datetime.fromtimestamp(gap_end_ms   / 1000, tz=timezone.utc).strftime("%m-%d %H:%M"),
     )
 
-    klines = fetch_klines(symbol, gap_start_ms, gap_end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
+    klines = exchange.fetch_klines(symbol, gap_start_ms, gap_end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
     if not klines:
         log.warning("[%s] No klines returned for this gap.", symbol)
         return 0
@@ -324,7 +192,7 @@ def backfill_symbol_influx(symbol: str, gap_start_ms: int, gap_end_ms: int, writ
 
 
 def run_influx_backfill():
-    """Entry point cho InfluxDB gap backfill."""
+    """Entry point for InfluxDB gap backfill."""
     from influxdb_client import InfluxDBClient
     from influxdb_client.client.write_api import SYNCHRONOUS
 
@@ -373,42 +241,30 @@ def run_influx_backfill():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INFLUXDB INITIAL POPULATE (Force pull N ngày cho tất cả symbols)
+# INFLUXDB INITIAL POPULATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def klines_to_candles_points(symbol: str, klines: list[list]) -> list:
-    """
-    Convert Binance klines to InfluxDB Points (candles measurement - matches Flink output).
-    Schema: candles measurement with interval=1m tag.
-    """
+    """Convert Binance klines to InfluxDB Points (candles measurement)."""
     from influxdb_client import Point, WritePrecision
 
     points = []
     for k in klines:
         try:
-            open_ms     = int(k[0])
-            open_price  = float(k[1])
-            high        = float(k[2])
-            low         = float(k[3])
-            close_price = float(k[4])
-            volume      = float(k[5])
-            quote_vol   = float(k[7])
-            trades      = int(k[8])
-
             point = (
                 Point("candles")
                 .tag("symbol",   symbol)
                 .tag("exchange", "binance")
                 .tag("interval", "1m")
-                .field("open",         open_price)
-                .field("high",         high)
-                .field("low",          low)
-                .field("close",        close_price)
-                .field("volume",       volume)
-                .field("quote_volume", quote_vol)
-                .field("trade_count",  trades)
+                .field("open",         float(k[1]))
+                .field("high",         float(k[2]))
+                .field("low",          float(k[3]))
+                .field("close",        float(k[4]))
+                .field("volume",       float(k[5]))
+                .field("quote_volume", float(k[7]))
+                .field("trade_count",  int(k[8]))
                 .field("is_closed",    True)
-                .time(open_ms, WritePrecision.MS)
+                .time(int(k[0]), WritePrecision.MS)
             )
             points.append(point)
         except Exception as e:
@@ -417,33 +273,21 @@ def klines_to_candles_points(symbol: str, klines: list[list]) -> list:
 
 
 def populate_symbol(symbol: str, start_ms: int, end_ms: int, write_api) -> int:
-    """
-    Force pull historical 1m candles for 1 symbol and write to InfluxDB (candles measurement).
-    Không check gap, pull thẳng toàn bộ khoảng thời gian.
-    Returns number of points written.
-    """
+    """Force pull historical 1m candles for a symbol to InfluxDB."""
     days = (end_ms - start_ms) / 1000 / 86400
-    log.info(
-        "[%s] Populate %.1f days (%s → %s)",
-        symbol, days,
-        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%m-%d"),
-        datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%m-%d"),
-    )
+    log.info("[%s] Populate %.1f days", symbol, days)
 
-    klines = fetch_klines(symbol, start_ms, end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
+    klines = exchange.fetch_klines(symbol, start_ms, end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
     if not klines:
-        log.warning("[%s] No klines returned.", symbol)
         return 0
 
-    log.info("[%s] Fetched %d candles, converting...", symbol, len(klines))
     points = klines_to_candles_points(symbol, klines)
-
     if not points:
         return 0
 
     try:
         write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
-        log.info("[%s] ✓ Written %d points to InfluxDB", symbol, len(points))
+        log.info("[%s] Written %d points to InfluxDB", symbol, len(points))
         return len(points)
     except Exception as e:
         log.error("[%s] Write error: %s", symbol, e)
@@ -451,38 +295,22 @@ def populate_symbol(symbol: str, start_ms: int, end_ms: int, write_api) -> int:
 
 
 def run_initial_populate(days: int = 90, symbols_list: list[str] | None = None):
-    """
-    Entry point cho initial populate mode.
-    Kéo N ngày 1m candles cho tất cả USDT symbols (hoặc danh sách cụ thể).
-    """
+    """Pull N days of 1m candles for all USDT symbols."""
     from influxdb_client import InfluxDBClient
     from influxdb_client.client.write_api import SYNCHRONOUS
 
-    log.info("=== InfluxDB Initial Populate ===")
-    log.info("Days: %d", days)
+    log.info("=== InfluxDB Initial Populate (days=%d) ===", days)
 
-    # Fetch all 400 USDT symbols from Binance (matching producer)
-    symbols = symbols_list or fetch_usdt_symbols()[:400]  # Cap at 400 like producer
-    log.info("Symbols: %d (all active USDT pairs)", len(symbols))
+    symbols = symbols_list or exchange.fetch_symbols()[:400]
+    log.info("Symbols: %d", len(symbols))
 
     end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - (days * 24 * 3600 * 1000)
 
-    log.info(
-        "Time range: %s → %s",
-        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
-        datetime.fromtimestamp(end_ms   / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
-    )
-    log.info(
-        "⚠️  This will take ~2-3 hours for 400 symbols × 90 days (~52M candles)."
-    )
-
-    # Connect InfluxDB
     client    = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
     write_api = client.write_api(write_options=SYNCHRONOUS)
     wait_for_influx(client)
 
-    # Populate in parallel
     total_points  = 0
     total_success = 0
 
@@ -491,7 +319,6 @@ def run_initial_populate(days: int = 90, symbols_list: list[str] | None = None):
             executor.submit(populate_symbol, sym, start_ms, end_ms, write_api): sym
             for sym in symbols
         }
-
         for future in as_completed(futures):
             sym = futures[future]
             try:
@@ -502,10 +329,8 @@ def run_initial_populate(days: int = 90, symbols_list: list[str] | None = None):
             except Exception as e:
                 log.error("[%s] Unexpected error: %s", sym, e)
 
-    log.info(
-        "Initial populate complete — %d/%d symbols, %d total points written.",
-        total_success, len(symbols), total_points,
-    )
+    log.info("Initial populate complete — %d/%d symbols, %d total points.",
+             total_success, len(symbols), total_points)
     client.close()
 
 
@@ -557,22 +382,14 @@ def build_spark():
 def ensure_iceberg_table(spark):
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {ICEBERG_CATALOG}.{ICEBERG_DB}")
     spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {FULL_TABLE_NAME} (
-            event_time      BIGINT,
-            symbol          STRING,
-            kline_start     BIGINT,
-            kline_close     BIGINT,
+        CREATE TABLE IF NOT EXISTS {ICEBERG_TABLE_KLINES} (
+            event_time      BIGINT, symbol STRING,
+            kline_start     BIGINT, kline_close BIGINT,
             interval        STRING,
-            open            DOUBLE,
-            high            DOUBLE,
-            low             DOUBLE,
-            close           DOUBLE,
-            volume          DOUBLE,
-            quote_volume    DOUBLE,
-            trade_count     BIGINT,
-            is_closed       BOOLEAN,
-            kline_timestamp TIMESTAMP,
-            ingested_at     TIMESTAMP
+            open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+            volume DOUBLE, quote_volume DOUBLE, trade_count BIGINT,
+            is_closed BOOLEAN,
+            kline_timestamp TIMESTAMP, ingested_at TIMESTAMP
         )
         USING iceberg
         PARTITIONED BY (days(kline_timestamp))
@@ -583,22 +400,22 @@ def ensure_iceberg_table(spark):
             'write.target-file-size-bytes'     = '134217728'
         )
     """)
-    log.info("Iceberg table %s is ready.", FULL_TABLE_NAME)
+    log.info("Iceberg table %s is ready.", ICEBERG_TABLE_KLINES)
 
 
 def get_last_open_time(spark, symbol: str) -> int:
+    from exchanges.binance.client import EPOCH_MS
     try:
         row = spark.sql(f"""
             SELECT MAX(kline_start) AS max_ts
-            FROM {FULL_TABLE_NAME}
-            WHERE symbol = '{symbol}'
-              AND interval = '1m'
+            FROM {ICEBERG_TABLE_KLINES}
+            WHERE symbol = '{symbol}' AND interval = '1m'
         """).first()
         if row and row["max_ts"]:
             return int(row["max_ts"]) + 60_000
     except Exception:
         pass
-    return BINANCE_EPOCH_MS
+    return EPOCH_MS
 
 
 def process_and_write_chunk(spark, rows: list, symbol: str, chunk_start_ms: int) -> int:
@@ -611,19 +428,19 @@ def process_and_write_chunk(spark, rows: list, symbol: str, chunk_start_ms: int)
         return 0
 
     kline_schema = StructType([
-        StructField("event_time",      LongType(),   False),
-        StructField("symbol",          StringType(), False),
-        StructField("kline_start",     LongType(),   False),
-        StructField("kline_close",     LongType(),   False),
-        StructField("interval",        StringType(), False),
-        StructField("open",            DoubleType(), True),
-        StructField("high",            DoubleType(), True),
-        StructField("low",             DoubleType(), True),
-        StructField("close",           DoubleType(), True),
-        StructField("volume",          DoubleType(), True),
-        StructField("quote_volume",    DoubleType(), True),
-        StructField("trade_count",     LongType(),   True),
-        StructField("is_closed",       BooleanType(), False),
+        StructField("event_time",  LongType(),    False),
+        StructField("symbol",     StringType(),   False),
+        StructField("kline_start", LongType(),    False),
+        StructField("kline_close", LongType(),    False),
+        StructField("interval",   StringType(),   False),
+        StructField("open",       DoubleType(),   True),
+        StructField("high",       DoubleType(),   True),
+        StructField("low",        DoubleType(),   True),
+        StructField("close",      DoubleType(),   True),
+        StructField("volume",     DoubleType(),   True),
+        StructField("quote_volume", DoubleType(), True),
+        StructField("trade_count", LongType(),    True),
+        StructField("is_closed",  BooleanType(),  False),
     ])
 
     df = spark.createDataFrame(rows, schema=kline_schema)
@@ -633,7 +450,7 @@ def process_and_write_chunk(spark, rows: list, symbol: str, chunk_start_ms: int)
         .withColumn("ingested_at", F.current_timestamp())
     )
     df = df.sortWithinPartitions("symbol", "kline_start")
-    df.writeTo(FULL_TABLE_NAME).append()
+    df.writeTo(ICEBERG_TABLE_KLINES).append()
 
     log.info("[%s] Wrote %d candles (chunk start=%s).", symbol, len(rows),
              datetime.fromtimestamp(chunk_start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"))
@@ -641,11 +458,7 @@ def process_and_write_chunk(spark, rows: list, symbol: str, chunk_start_ms: int)
 
 
 def write_symbol_iceberg(spark, symbol: str, start_ms: int, end_ms: int) -> int:
-    """Pull 1m klines page-by-page and write to Iceberg incrementally.
-
-    This avoids loading a full multi-year history into memory, which improves
-    reliability for full backfill (all available 1m candles).
-    """
+    """Pull 1m klines page-by-page and write to Iceberg incrementally."""
     total_written  = 0
     current_ms     = start_ms
     chunk_start_ms = start_ms
@@ -656,12 +469,10 @@ def write_symbol_iceberg(spark, symbol: str, start_ms: int, end_ms: int) -> int:
         for attempt in range(MAX_RETRIES):
             try:
                 resp = requests.get(
-                    BINANCE_KLINES_URL,
+                    "https://api.binance.com/api/v3/klines",
                     params={
-                        "symbol": symbol,
-                        "interval": "1m",
-                        "startTime": current_ms,
-                        "endTime": end_ms,
+                        "symbol": symbol, "interval": "1m",
+                        "startTime": current_ms, "endTime": end_ms,
                         "limit": KLINES_PER_REQ,
                     },
                     timeout=15,
@@ -675,7 +486,7 @@ def write_symbol_iceberg(spark, symbol: str, start_ms: int, end_ms: int) -> int:
                 klines = resp.json()
                 break
             except Exception as e:
-                log.warning("[%s] page fetch attempt %d failed at %d: %s", symbol, attempt + 1, current_ms, e)
+                log.warning("[%s] page fetch attempt %d failed: %s", symbol, attempt + 1, e)
                 time.sleep(2 ** attempt)
 
         if klines is None:
@@ -686,22 +497,14 @@ def write_symbol_iceberg(spark, symbol: str, start_ms: int, end_ms: int) -> int:
         for k in klines:
             open_ms = int(k[0])
             chunk_buffer.append([
-                open_ms,
-                symbol,
-                open_ms,
-                int(k[6]),
+                open_ms, symbol, open_ms, int(k[6]),
                 "1m",
-                float(k[1]),
-                float(k[2]),
-                float(k[3]),
-                float(k[4]),
-                float(k[5]),
-                float(k[7]),
-                int(k[8]),
+                float(k[1]), float(k[2]), float(k[3]), float(k[4]),
+                float(k[5]), float(k[7]), int(k[8]),
                 True,
             ])
 
-        if len(chunk_buffer) >= BACKFILL_FLUSH_THRESHOLD:
+        if len(chunk_buffer) >= FLUSH_THRESHOLD:
             total_written += process_and_write_chunk(spark, chunk_buffer, symbol, chunk_start_ms)
             chunk_buffer.clear()
             chunk_start_ms = int(klines[-1][0]) + 60_000
@@ -721,13 +524,13 @@ def write_symbol_iceberg(spark, symbol: str, start_ms: int, end_ms: int) -> int:
 
 
 def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list[str] | None = None):
-    """Entry point cho Iceberg historical import."""
+    """Entry point for Iceberg historical import."""
     log.info("=== Iceberg Historical Import (mode=%s) ===", iceberg_mode)
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     end_ms = now_ms - (now_ms % 60_000)
 
-    symbols = symbols_list or fetch_usdt_symbols()
+    symbols = symbols_list or exchange.fetch_symbols()
     log.info("Symbols: %d | End: %s", len(symbols),
              datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 
@@ -736,12 +539,10 @@ def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list
     ensure_iceberg_table(spark)
 
     total_rows = 0
-    total_syms = len(symbols)
-
     for idx, symbol in enumerate(symbols, 1):
-        log.info("[%d/%d] Processing %s ...", idx, total_syms, symbol)
+        log.info("[%d/%d] Processing %s ...", idx, len(symbols), symbol)
         if iceberg_mode == "backfill":
-            start_ms = fetch_first_available_1m_start(symbol)
+            start_ms = exchange.fetch_first_available_start(symbol)
         else:
             start_ms = get_last_open_time(spark, symbol)
 
@@ -756,24 +557,6 @@ def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list
             log.error("[%s] Failed: %s — skipping.", symbol, e)
 
     log.info("Done. Total candles written: %d", total_rows)
-
-    # Print table stats
-    try:
-        size_df = spark.sql(f"""
-            SELECT
-                COUNT(*)                AS total_rows,
-                COUNT(DISTINCT symbol)  AS total_symbols,
-                MIN(kline_timestamp)    AS earliest,
-                MAX(kline_timestamp)    AS latest
-            FROM {FULL_TABLE_NAME}
-            WHERE interval = '1m'
-        """)
-        size_df.show(truncate=False)
-        files_df = spark.sql(f"SELECT SUM(file_size_in_bytes) AS bytes FROM {FULL_TABLE_NAME}.files")
-        files_df.show()
-    except Exception as e:
-        log.warning("Could not compute table stats: %s", e)
-
     spark.stop()
 
 
@@ -783,36 +566,18 @@ def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified backfill (gap fill) + populate (initial) + historical import (Iceberg).",
+        description="Unified backfill + populate + historical import.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument(
-        "--mode", choices=["influx", "iceberg", "populate", "all"], default="all",
-        help=(
-            "influx   = fill InfluxDB gaps\n"
-            "iceberg  = historical klines → Iceberg\n"
-            "populate = force pull N days for all symbols (lần đầu khởi động)\n"
-            "all      = influx + iceberg (default, không bao gồm populate)"
-        ),
-    )
-    parser.add_argument(
-        "--iceberg-mode", choices=["backfill", "incremental"], default="incremental",
-        help="backfill    = kéo từ 2017 → nay (chạy 1 lần đầu)\nincremental = từ nến cuối → nay (default)",
-    )
-    parser.add_argument(
-        "--symbols", nargs="*", default=None,
-        help="Danh sách symbols cụ thể (VD: BTCUSDT ETHUSDT). Mặc định: tất cả USDT pairs.",
-    )
-    parser.add_argument(
-        "--days", type=int, default=90,
-        help="Số ngày lịch sử muốn pull cho mode populate (default: 90 = 3 tháng)",
-    )
+    parser.add_argument("--mode", choices=["influx", "iceberg", "populate", "all"], default="all")
+    parser.add_argument("--iceberg-mode", choices=["backfill", "incremental"], default="incremental")
+    parser.add_argument("--symbols", nargs="*", default=None)
+    parser.add_argument("--days", type=int, default=90)
     args = parser.parse_args()
 
-    log.info("=== Backfill, Populate & Historical Import | mode=%s ===", args.mode)
+    log.info("=== Backfill & Historical Import | mode=%s ===", args.mode)
 
     if args.mode == "populate":
-        # Initial populate mode — force pull N days for all symbols
         try:
             run_initial_populate(days=args.days, symbols_list=args.symbols)
         except Exception as e:
@@ -827,10 +592,7 @@ def main():
 
     if args.mode in ("iceberg", "all"):
         try:
-            run_iceberg_historical(
-                iceberg_mode=args.iceberg_mode,
-                symbols_list=args.symbols,
-            )
+            run_iceberg_historical(iceberg_mode=args.iceberg_mode, symbols_list=args.symbols)
         except Exception as e:
             log.error("Iceberg historical import failed: %s", e)
 

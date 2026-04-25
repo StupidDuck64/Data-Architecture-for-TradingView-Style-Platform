@@ -668,7 +668,8 @@ services:
 
   producer:
     build:
-      context: ./docker/producer
+      context: .
+      dockerfile: docker/producer/Dockerfile
     container_name: producer
     hostname: producer
     restart: unless-stopped

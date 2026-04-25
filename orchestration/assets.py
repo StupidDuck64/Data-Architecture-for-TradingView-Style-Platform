@@ -86,7 +86,7 @@ def _run_spark_job(context: AssetExecutionContext, script_name: str, extra_args:
 def backfill_historical(context: AssetExecutionContext) -> None:
     _run_spark_job(
         context,
-        script_name="backfill_historical.py",
+        script_name="batch/backfill.py",
         extra_args=["--mode", "all", "--iceberg-mode", "incremental"],
     )
 
@@ -102,7 +102,7 @@ def backfill_historical(context: AssetExecutionContext) -> None:
 def aggregate_candles(context: AssetExecutionContext) -> None:
     _run_spark_job(
         context,
-        script_name="aggregate_candles.py",
+        script_name="batch/aggregate.py",
         extra_args=["--mode", "all"],
     )
 
@@ -120,7 +120,7 @@ def aggregate_candles(context: AssetExecutionContext) -> None:
 def iceberg_table_maintenance(context: AssetExecutionContext) -> None:
     _run_spark_job(
         context,
-        script_name="iceberg_maintenance.py",
+        script_name="batch/maintenance.py",
     )
 
 

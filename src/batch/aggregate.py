@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-aggregate_candles.py
-────────────────────
 Retention maintenance for 1m candle stores.
 
-Data strategy:
-- KeyDB keeps real-time 1s candles for short-term charting.
-- InfluxDB keeps 1m candles for 90 days.
-- Lakehouse (Iceberg on MinIO) keeps 1m candles for long-term history.
+- InfluxDB: deletes 1m candles older than RETENTION_1M_DAYS
+- Iceberg: deletes 1m candles older than RETENTION_1M_DAYS
 
 Higher intervals (5m, 15m, 1h, ...) are derived on query from 1m data,
 so this job only enforces retention and does not pre-aggregate fixed frames.
 
 Usage:
-    python aggregate_candles.py --mode influx
-    python aggregate_candles.py --mode iceberg
-    python aggregate_candles.py --mode all
-    python aggregate_candles.py --mode all --retention-days 90
+    python aggregate.py --mode influx
+    python aggregate.py --mode iceberg
+    python aggregate.py --mode all
+    python aggregate.py --mode all --retention-days 90
 """
 
 from __future__ import annotations
@@ -24,20 +20,22 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
-INFLUX_URL = os.environ.get("INFLUX_URL", "http://influxdb:8086")
-INFLUX_TOKEN = os.environ.get("INFLUX_TOKEN", "")
-INFLUX_ORG = os.environ.get("INFLUX_ORG", "vi")
-INFLUX_BUCKET = os.environ.get("INFLUX_BUCKET", "crypto")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY", "")
-
-RETENTION_1M_DAYS = int(os.environ.get("RETENTION_1M_DAYS", "90"))
-
-ICEBERG_KLINES = "iceberg_catalog.crypto_lakehouse.coin_klines"
+from common.config import (
+    ICEBERG_TABLE_KLINES,
+    INFLUX_BUCKET,
+    INFLUX_ORG,
+    INFLUX_TOKEN,
+    INFLUX_URL,
+    MINIO_ACCESS_KEY,
+    MINIO_ENDPOINT,
+    MINIO_SECRET_KEY,
+    RETENTION_1M_DAYS,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,10 +82,8 @@ def cleanup_iceberg_1m(retention_days: int):
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.iceberg_catalog", "org.apache.iceberg.spark.SparkCatalog")
         .config("spark.sql.catalog.iceberg_catalog.type", "jdbc")
-        .config(
-            "spark.sql.catalog.iceberg_catalog.uri",
-            f"jdbc:postgresql://{os.environ.get('POSTGRES_HOST', 'postgres')}:5432/iceberg_catalog",
-        )
+        .config("spark.sql.catalog.iceberg_catalog.uri",
+                f"jdbc:postgresql://{os.environ.get('POSTGRES_HOST', 'postgres')}:5432/iceberg_catalog")
         .config("spark.sql.catalog.iceberg_catalog.jdbc.user", os.environ.get("POSTGRES_USER", ""))
         .config("spark.sql.catalog.iceberg_catalog.jdbc.password", os.environ.get("POSTGRES_PASSWORD", ""))
         .config("spark.sql.catalog.iceberg_catalog.warehouse", "s3://cryptoprice/iceberg")
@@ -104,22 +100,18 @@ def cleanup_iceberg_1m(retention_days: int):
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
-        .config(
-            "spark.hadoop.fs.s3a.aws.credentials.provider",
-            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-        )
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+                "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
         .config("spark.sql.defaultCatalog", "iceberg_catalog")
         .getOrCreate()
     )
 
-    spark.sql(
-        f"""
-        DELETE FROM {ICEBERG_KLINES}
+    spark.sql(f"""
+        DELETE FROM {ICEBERG_TABLE_KLINES}
         WHERE interval = '1m'
           AND is_closed = true
           AND kline_start < {cutoff_ms}
-        """
-    )
+    """)
 
     spark.stop()
     log.info("Iceberg cleanup complete.")
@@ -127,18 +119,10 @@ def cleanup_iceberg_1m(retention_days: int):
 
 def main():
     parser = argparse.ArgumentParser(description="1m candle retention maintenance")
-    parser.add_argument(
-        "--mode",
-        choices=["influx", "iceberg", "all"],
-        default="all",
-        help="Which backend to maintain (default: all)",
-    )
-    parser.add_argument(
-        "--retention-days",
-        type=int,
-        default=RETENTION_1M_DAYS,
-        help=f"Retention for 1m candles (default: {RETENTION_1M_DAYS})",
-    )
+    parser.add_argument("--mode", choices=["influx", "iceberg", "all"], default="all",
+                        help="Which backend to maintain (default: all)")
+    parser.add_argument("--retention-days", type=int, default=RETENTION_1M_DAYS,
+                        help=f"Retention for 1m candles (default: {RETENTION_1M_DAYS})")
     args = parser.parse_args()
 
     retention_days = max(args.retention_days, 1)
