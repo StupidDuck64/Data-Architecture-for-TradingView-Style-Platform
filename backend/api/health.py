@@ -1,44 +1,22 @@
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+"""
+Health check API endpoint.
+"""
+
 import time
+from datetime import datetime, timezone
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import APIRouter
 
-from serving.config import CORS_ORIGINS
-from serving.connections import close_all, get_redis, get_influx, get_trino_connection
-from serving.routers import ticker, klines, orderbook, trades, symbols, indicators, ws, historical
+from backend.core.database import get_redis, get_influx, get_trino_connection
 
+router = APIRouter(prefix="/api", tags=["health"])
 
 APP_START_TS = time.time()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await close_all()
-
-
-app = FastAPI(title="CryptoDashboard API", version="1.0.0", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-for router in (
-    ticker.router, klines.router, orderbook.router,
-    trades.router, symbols.router, indicators.router, ws.router,
-    historical.router,
-):
-    app.include_router(router)
-
-
-@app.get("/api/health")
+@router.get("/health")
 async def health():
+    """Check connectivity to all backend dependencies and report overall status."""
     overall_start = time.perf_counter()
     checks = {}
     latencies = {}

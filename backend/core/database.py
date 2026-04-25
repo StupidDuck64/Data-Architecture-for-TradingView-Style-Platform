@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import redis.asyncio as aioredis
 from influxdb_client import InfluxDBClient
 import trino
 
-from serving.config import (
+from backend.core.config import (
     REDIS_HOST, REDIS_PORT,
     INFLUX_URL, INFLUX_TOKEN, INFLUX_ORG,
     TRINO_HOST, TRINO_PORT,

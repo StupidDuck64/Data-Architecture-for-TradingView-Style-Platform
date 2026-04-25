@@ -1,18 +1,11 @@
 /**
  * marketDataService.js
- * ─────────────────────────────────────────────────────────────────
- * Service layer for OHLCV market data.
  *
- * Architecture:
- *  • All data access goes through this service — never fetch directly in components.
- *  • Mock mode:  returns generated sample data.
- *  • API mode:   calls the FastAPI backend via Nginx reverse proxy.
- *               The function signatures & return shapes stay the same,
- *               so the rest of the app needs zero changes.
+ * Service layer for OHLCV market data.
+ * All data access goes through this service — never fetch directly in components.
  *
  * OHLCV candle shape expected by lightweight-charts:
  *  { time: number (unix seconds), open, high, low, close, volume }
- * ─────────────────────────────────────────────────────────────────
  */
 
 // ─── Config ──────────────────────────────────────────────────────
@@ -20,7 +13,7 @@
 const DATA_SOURCE = process.env.REACT_APP_DATA_SOURCE || "api"; // 'mock' | 'api'
 
 // Base URL of your backend REST/WebSocket endpoint.
-// Defaults to '/api' for Nginx reverse-proxy setup.
+// Defaults to '/api' when served behind a reverse proxy.
 // For local dev without Docker: REACT_APP_API_BASE_URL=http://localhost:8080/api
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || "/api";
 
@@ -210,10 +203,10 @@ export async function fetchSymbols() {
   ];
 }
 
-// ─── Historical Candles (Iceberg via Trino) ───────────────────────
+// ─── Historical Candles ────────────────────────────────────────────
 
 /**
- * Fetch historical hourly candles from Iceberg cold storage.
+ * Fetch historical candles for a specific date range.
  *
  * @param {string} symbol      e.g. 'BTCUSDT'
  * @param {number} startMs     range start in epoch milliseconds

@@ -5,8 +5,8 @@ WORKDIR /app
 COPY docker/fastapi/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY serving/ serving/
+COPY backend/ backend/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "serving.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

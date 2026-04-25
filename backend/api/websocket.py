@@ -1,3 +1,9 @@
+"""
+WebSocket streaming API for real-time candle updates.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -5,15 +11,11 @@ import time
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from serving.connections import get_redis
+from backend.core.constants import INTERVAL_SECONDS
+from backend.core.database import get_redis
 
 router = APIRouter(prefix="/api", tags=["websocket"])
 log = logging.getLogger(__name__)
-
-INTERVAL_SECONDS = {
-    "1s": 1, "1m": 60, "5m": 300, "15m": 900,
-    "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800,
-}
 
 
 @router.websocket("/stream")
@@ -23,8 +25,6 @@ async def stream(websocket: WebSocket, symbol: str = "", interval: str = "1m"):
 
     The frontend connects with:
         ``ws://host/api/stream?symbol=BTCUSDT&interval=1m``
-
-    Each frame: ``{"openTime": ms, "open": float, "high": float, ...}``
     """
     await websocket.accept()
     r = await get_redis()
@@ -33,7 +33,7 @@ async def stream(websocket: WebSocket, symbol: str = "", interval: str = "1m"):
     if interval not in INTERVAL_SECONDS:
         await websocket.close(code=1008)
         return
-    target_sec = INTERVAL_SECONDS.get(interval, 60)
+    target_sec = INTERVAL_SECONDS[interval]
     target_ms = target_sec * 1000
     last_sent: dict | None = None
 
@@ -52,45 +52,33 @@ async def stream(websocket: WebSocket, symbol: str = "", interval: str = "1m"):
 
 async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict | None:
     """Build the latest candle by merging Flink aggregate data with the
-    real-time ticker price.
+    real-time ticker price."""
 
-    The kline Flink pipeline processes ~400 symbols and can lag several
-    minutes behind wall-clock time.  ``ticker:latest`` is near-real-time
-    (seconds old) so we use it to keep the chart's live candle agitating.
-    """
-    # ── Read the real-time ticker price (near-zero lag) ──────────────
+    # Read the real-time ticker price (near-zero lag)
     ticker = await r.hgetall(f"ticker:latest:{symbol}")
     live_price = float(ticker["price"]) if ticker.get("price") else None
     live_ts = int(ticker["event_time"]) if ticker.get("event_time") else None
 
-    # ── 1s interval ──────────────────────────────────────────────────
+    # 1s interval: serve directly from KeyDB
     if interval == "1s":
         raw = await r.zrevrange(f"candle:1s:{symbol}", 0, 0)
         if raw:
             c = json.loads(raw[0])
-            candle = {
+            return {
                 "openTime": int(c["t"]),
                 "open": c["o"], "high": c["h"],
                 "low": c["l"], "close": c["c"],
                 "volume": c["v"],
             }
-        else:
-            candle = None
+        return None
 
-        # Do not synthesize or overwrite 1s candles with ticker price.
-        # This keeps 1s OHLC as close as possible to exchange kline stream values.
-        return candle
-
-    # ── 1m and larger ────────────────────────────────────────────────
-    # Aggregate from the appropriate source sorted set.
-    # Use data-driven window: find the latest candle's timestamp and aggregate
-    # the window it belongs to.
+    # 1m+: aggregate from the appropriate source sorted set
     source_key = f"candle:1s:{symbol}" if interval == "1m" else f"candle:1m:{symbol}"
     latest = await r.zrevrange(source_key, 0, 0, withscores=True)
 
     flink_candle = None
     flink_window = 0
-    latest_source_ts = 0  # newest timestamp from source candle data
+    latest_source_ts = 0
     if latest:
         latest_score = int(latest[0][1])
         flink_window = (latest_score // target_ms) * target_ms
@@ -109,16 +97,14 @@ async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict |
                 "volume": round(sum(c["v"] for c in candles), 8),
             }
 
-    # Keep 1m candles exchange-consistent: no ticker-based override.
+    # Keep 1m candles exchange-consistent: no ticker-based override
     if interval == "1m":
         return flink_candle
 
-    # Merge with real-time ticker for 5m+ only if ticker is newer and still
-    # inside the currently open target window.
+    # Merge with real-time ticker for 5m+ only
     if live_price and live_ts:
         live_window = (live_ts // target_ms) * target_ms
         if flink_candle and live_window == flink_window:
-            # Same window — only update if ticker is fresher than source candles
             window_close_ms = flink_window + target_ms
             if live_ts > latest_source_ts and int(time.time() * 1000) < window_close_ms:
                 flink_candle["close"] = live_price
@@ -126,7 +112,6 @@ async def _build_candle(r, symbol: str, interval: str, target_ms: int) -> dict |
                 flink_candle["low"] = min(flink_candle["low"], live_price)
             return flink_candle
         if live_window > flink_window:
-            # Ticker is in a newer window → synthesise a candle from ticker price
             return {
                 "openTime": live_window,
                 "open": live_price, "high": live_price,

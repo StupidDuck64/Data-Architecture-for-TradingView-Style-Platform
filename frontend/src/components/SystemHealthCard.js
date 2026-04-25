@@ -83,7 +83,7 @@ const SystemHealthCard = () => {
       {showTooltip && (
         <div className="absolute top-full left-0 mt-2 w-72 p-3 rounded-lg border border-gray-600 bg-gray-900 shadow-2xl z-[220] text-xs">
           <div className="flex items-center justify-between mb-2">
-            <span className="font-semibold text-gray-200">System Diagnostics</span>
+            <span className="font-semibold text-gray-200">Status</span>
             {healthData?.status && (
               <span
                 className={`px-1.5 py-0.5 rounded font-medium ${
@@ -121,13 +121,13 @@ const SystemHealthCard = () => {
 
               <div className="border-t border-gray-700 pt-1.5">
                 <div className="text-gray-400 mb-1">Dependencies</div>
-                {["keydb", "influxdb", "trino"].map((svc) => {
+                {[{key: "keydb", label: "Cache"}, {key: "influxdb", label: "Time-Series DB"}, {key: "trino", label: "Query Engine"}].map(({key: svc, label}) => {
                   const status = healthData.checks?.[svc];
                   const latency = healthData.latency_ms?.[`${svc}_ms`];
                   const ok = status === "ok";
                   return (
                     <div key={svc} className="flex items-center justify-between">
-                      <span className={ok ? "text-gray-300" : "text-red-300"}>{svc}</span>
+                      <span className={ok ? "text-gray-300" : "text-red-300"}>{label}</span>
                       <span className={ok ? "text-gray-300" : "text-red-300"}>
                         {ok ? `${latency ?? "-"} ms` : "error"}
                       </span>

@@ -2,7 +2,7 @@ import os
 import sys
 import logging
 
-log = logging.getLogger("serving.config")
+log = logging.getLogger("backend.core.config")
 
 # ─── KeyDB (Redis-compatible) ───────────────────────────────────────────────
 REDIS_HOST = os.environ.get("REDIS_HOST", "keydb")

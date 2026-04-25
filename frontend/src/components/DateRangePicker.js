@@ -2,8 +2,8 @@ import React, { useState, useRef, useEffect } from "react";
 import { Calendar, X, Clock } from "lucide-react";
 
 /**
- * DateRangePicker — lets the user pick a start/end date to query
- * historical cold storage (Iceberg).
+ * DateRangePicker — lets the user pick a start/end date to view
+ * historical candle data.
  *
  * Props:
  *   onApply({ startMs, endMs })  — called when user confirms a date range
@@ -74,7 +74,7 @@ const DateRangePicker = ({ onApply, onClear, active = false }) => {
       {open && (
         <div className="absolute right-0 top-full mt-1 z-[110] bg-gray-800 border border-gray-600 rounded-lg shadow-xl p-3 w-72">
           <div className="text-xs text-gray-400 mb-2 font-medium">
-            Query historical data
+            Select Date Range
           </div>
 
           {/* Presets */}
@@ -128,7 +128,7 @@ const DateRangePicker = ({ onApply, onClear, active = false }) => {
               onClick={handleApply}
               className="flex-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded transition-colors"
             >
-              Load Historical
+              Apply
             </button>
             {active && (
               <button

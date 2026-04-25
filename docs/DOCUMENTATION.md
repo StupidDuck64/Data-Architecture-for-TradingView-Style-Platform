@@ -1,13 +1,19 @@
-﻿# Tài liệu Kỹ thuật — Lambda Architecture Crypto Platform
+# Tài liệu Kỹ thuật — Lambda Architecture Crypto Platform
 
 > **Mục tiêu tài liệu:** Giải thích sâu toàn bộ hệ thống từ luồng dữ liệu, kiến trúc, từng service, đến logic xử lý trong code — để bạn hiểu được "cái gì làm gì và tại sao".
 
-> **Bổ sung cập nhật hiện trạng (2026-03-20):**
+> **Bổ sung cập nhật hiện trạng (2026-04-25):**
 > - Docker Compose hiện chạy theo cấu hình **21 services**.
+> - **Backend đã refactor**: `serving/` → `backend/` (MVC: `api/`, `services/`, `models/`, `core/`).
+> - **Dev/Prod mode**: `docker-compose.override.yml` (dev), `docker-compose.prod.yml` (prod).
+> - **Makefile**: `make dev`, `make prod`, `make test`, `make test-cov`.
+> - **Testing**: pytest framework with 40+ tests (unit, security).
 > - Endpoint historical chính thức: `GET /api/klines/historical`.
 > - WebSocket stream: `WS /api/stream?symbol=&interval=`.
-> - Dagster chỉ giữ 2 schedule: `daily_candle_aggregation` (04:00 hằng ngày) và `weekly_iceberg_maintenance` (03:00 Chủ Nhật). `backfill_historical` là asset chạy thủ công.
-> - Frontend chart mặc định mở theo số nến cuối: timeframe <= 1h dùng 50 nến, timeframe > 1h dùng 20 nến; nếu thiếu dữ liệu sẽ tự preload thêm nến lịch sử (bao gồm historical view).
+> - Dagster chỉ giữ 2 schedule: `daily_candle_aggregation` (04:00 hằng ngày) và `weekly_iceberg_maintenance` (03:00 Chủ Nhật).
+> - HTTPS automation: Let's Encrypt via certbot + DuckDNS dynamic DNS.
+> - Nginx rate limiting: 30r/s API, 5r/s WebSocket per IP.
+> - Xem `docs/TRACKING.md` (gitignored) cho changelog chi tiết.
 
 ---
 
@@ -19,7 +25,7 @@
 4. [Lớp Data (Data Layer)](#4-lớp-data-data-layer)
 5. [Lớp Compute (Processing Layer)](#5-lớp-compute-processing-layer)
 6. [Lớp Query & Orchestration](#6-lớp-query--orchestration)
-7. [Lớp Serving (FastAPI)](#7-lớp-serving-fastapi)
+7. [Lớp API (Backend)](#7-lớp-api-backend)
 8. [Lớp Frontend (React)](#8-lớp-frontend-react)
 9. [Chi tiết từng file source code](#9-chi-tiết-từng-file-source-code)
 10. [Kafka topics và Avro schemas](#10-kafka-topics-và-avro-schemas)
@@ -34,7 +40,7 @@
 
 ## 1. Tổng quan dự án
 
-**Lambda Architecture for TradingView-Style Platform** là một hệ thống real-time xử lý và hiển thị giá tiền điện tử, hoạt động hoàn toàn trên Docker (21 services theo `docker-compose.yml` hiện tại). Hệ thống theo dõi ~400 cặp USDT Spot từ Binance, xử lý dữ liệu theo kiến trúc Lambda gồm 3 lớp: **Speed layer** (Flink), **Batch layer** (Spark), **Serving layer** (FastAPI + KeyDB), và hiển thị qua dashboard TradingView-style (React + lightweight-charts).
+**Lambda Architecture for TradingView-Style Platform** là một hệ thống real-time xử lý và hiển thị giá tiền điện tử, hoạt động hoàn toàn trên Docker (21 services theo `docker-compose.yml` hiện tại). Hệ thống theo dõi ~400 cặp USDT Spot từ Binance, xử lý dữ liệu theo kiến trúc Lambda gồm 3 lớp: **Speed layer** (Flink), **Batch layer** (Spark), **API layer** (FastAPI + KeyDB), và hiển thị qua dashboard TradingView-style (React + lightweight-charts).
 
 **Tech stack:**
 
@@ -106,7 +112,7 @@ Kiến trúc Lambda chia dữ liệu xử lý thành 3 đường song song:
                │               │                │
                └───────────────┴────────────────┘
                                        │
-                               [FastAPI Serving Layer]
+                               [FastAPI API Layer]
                                /api/klines, /api/stream (WS)
                                /api/ticker, /api/orderbook
                                /api/klines/historical (Trino)
@@ -122,7 +128,7 @@ Kiến trúc Lambda chia dữ liệu xử lý thành 3 đường song song:
 
 - **Speed layer** (Flink): Xử lý real-time với độ trễ < 2s, lưu vào KeyDB + InfluxDB
 - **Batch layer** (Spark): Xử lý lại chính xác dữ liệu lịch sử, lưu vào Iceberg (MinIO)
-- **Serving layer** (FastAPI): Merge 2 nguồn theo độ ưu tiên: KeyDB → InfluxDB → Trino/Iceberg
+- **API layer** (FastAPI): Merge 2 nguồn theo độ ưu tiên: KeyDB → InfluxDB → Trino/Iceberg
 
 ---
 
@@ -184,7 +190,7 @@ Dagster schedule (weekly Sunday 03:00 UTC):
   spark-submit iceberg_maintenance.py
 ```
 
-### 3.3 API serving path
+### 3.3 API serving path (backend/)
 
 ```
 GET /api/klines?symbol=BTCUSDT&interval=5m&limit=200
@@ -280,14 +286,15 @@ Lưu metadata cho 2 mục đích:
 
 ### 5.1 Apache Flink 1.18.1 — Speed Layer
 
-**2 containers:** `flink-jobmanager` (1.75GB RAM) và `flink-taskmanager` (4.5GB RAM)
+**2 containers:** `flink-jobmanager` (2.5GB RAM cap) và `flink-taskmanager` (7GB RAM cap, 6GB reserved)
 
 **Job file:** `src/ingest_flink_crypto.py` — PyFlink, submit qua REST API
 
 **Checkpointing:**
-- Backend: RocksDB incremental checkpoints
-- Interval: 60s
-- Storage: MinIO `flink-checkpoints/`
+- Backend: HashMapStateBackend
+- Interval: 120s, mode: EXACTLY_ONCE, unaligned checkpoints enabled
+- Min pause: 30s, timeout: 120s
+- Storage: `file:///tmp/flink-checkpoints` (mounted volume)
 - Failover: Tự động restart từ checkpoint gần nhất khi job crash
 
 **Web UI:** http://localhost:8081
@@ -464,9 +471,9 @@ Dagster Daemon poll schedule mỗi 30s, tạo Run khi đến schedule, submit Sp
 
 ---
 
-## 7. Lớp Serving (FastAPI)
+## 7. Lớp API (Backend)
 
-`serving/` — FastAPI app với 8 routers, tất cả mount dưới `/api/`
+`backend/` — FastAPI app theo kiến trúc MVC:
 
 ### 7.1 `main.py`
 
@@ -771,23 +778,33 @@ onVisibleLogicalRangeChanged(range):
 
 | File | Dòng code | Chức năng chính |
 |---|---|---|
-| `src/producer_binance.py` | ~320 | Binance WS → Kafka Avro producer |
-| `src/ingest_flink_crypto.py` | ~1070 | Flink job: 5 pipelines, 8 writer classes |
-| `src/backfill_historical.py` | ~400 | Multi-mode backfill script (Spark/direct) |
-| `src/aggregate_candles.py` | ~200 | Spark 1m→1h aggregation + retention |
-| `src/candle_query_helper.py` | ~150 | Shared Flux query helpers |
-| `src/iceberg_maintenance.py` | ~100 | Iceberg compaction + snapshot expiry |
-| `serving/main.py` | ~60 | FastAPI app root, CORS, routers |
-| `serving/connections.py` | ~80 | Singleton connection management |
-| `serving/routers/klines.py` | ~310 | OHLCV REST endpoint (core logic) |
-| `serving/routers/ws.py` | ~220 | WebSocket real-time candle stream |
-| `serving/routers/ticker.py` | ~80 | Ticker price/stats endpoint |
-| `serving/routers/historical.py` | ~120 | Trino-based historical queries |
-| `serving/routers/orderbook.py` | ~50 | Order book depth endpoint |
-| `serving/routers/trades.py` | ~50 | Recent trades endpoint |
-| `orchestration/assets.py` | ~120 | Dagster asset + schedule definitions |
-| `frontend/src/components/CandlestickChart.js` | ~620 | Main chart component |
-| `frontend/src/services/marketDataService.js` | ~260 | API service layer |
+| `src/ingest_flink_crypto.py` | 995 | Flink job: 5 pipelines, 7+ writer/processor classes |
+| `src/backfill_historical.py` | 841 | Multi-mode backfill script (Spark/direct) |
+| `src/producer_binance.py` | 631 | Binance WS → Kafka Avro producer |
+| `src/candle_query_helper.py` | 357 | Shared Flux query helpers |
+| `src/ingest_crypto.py` | 324 | Spark Structured Streaming → Iceberg |
+| `src/iceberg_maintenance.py` | 173 | Iceberg compaction + snapshot expiry |
+| `src/aggregate_candles.py` | 163 | Spark 1m→1h aggregation + retention |
+| `frontend/src/components/CandlestickChart.js` | 997 | Main chart component |
+| `frontend/src/services/marketDataService.js` | 388 | API service layer |
+| `frontend/src/App.js` | 290 | Main React app layout |
+| `backend/api/klines.py` | ~170 | OHLCV REST endpoint (thin handler) |
+| `backend/api/historical.py` | ~90 | Historical range queries |
+| `backend/api/websocket.py` | ~135 | WebSocket real-time candle stream |
+| `backend/api/orderbook.py` | ~85 | Order book depth endpoint |
+| `backend/api/health.py` | ~65 | Health check endpoint |
+| `backend/app.py` | ~50 | FastAPI app root, CORS, routers |
+| `backend/core/database.py` | ~50 | Singleton connection management |
+| `backend/core/config.py` | ~30 | Environment variable config |
+| `backend/core/constants.py` | ~35 | Shared constants |
+| `backend/services/candle_service.py` | ~280 | Core OHLCV business logic |
+| `backend/models/candle.py` | ~15 | Pydantic candle response model |
+| `backend/models/ticker.py` | ~55 | Pydantic ticker/orderbook/trade models |
+| `backend/api/ticker.py` | ~43 | Ticker price/stats endpoint |
+| `backend/api/trades.py` | ~37 | Recent trades endpoint |
+| `backend/api/symbols.py` | ~30 | Symbols list endpoint |
+| `backend/api/indicators.py` | ~20 | SMA/EMA indicators endpoint |
+| `orchestration/assets.py` | 151 | Dagster asset + schedule definitions |
 
 ---
 
@@ -1055,7 +1072,7 @@ docker exec flink-jobmanager flink run \
 ### Rebuild sau khi sửa code
 
 ```bash
-# FastAPI (serving/ thay đổi)
+# FastAPI (backend/ thay đổi)
 docker compose up -d --build fastapi
 
 # Frontend (frontend/ thay đổi)
@@ -1247,6 +1264,7 @@ if idx == candlesRef.current.length - 1 && intervalMs >= 60000:
 ---
 
 **Ghi chú phiên bản tài liệu:**
-- Phiên bản: 2.0
-- Cập nhật lần cuối: Tháng 3 2026
-- Covers commit: `de437e6` (fix: prevent chart flickering)
+- Phiên bản: 2.1
+- Cập nhật lần cuối: 2026-04-25
+- Covers commit: `0802fe0` (HEAD, main)
+- Cập nhật bởi: AI assistant (xem `docs/TRACKING.md` cho changelog chi tiết)

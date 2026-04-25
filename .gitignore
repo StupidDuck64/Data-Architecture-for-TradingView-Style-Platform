@@ -31,3 +31,10 @@ spark-events/
 # OS
 .DS_Store
 Thumbs.db
+
+.idea
+.gitignore
+.env
+
+# AI assistant tracking (local only)
+docs/TRACKING.md

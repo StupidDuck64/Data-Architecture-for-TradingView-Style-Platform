@@ -1,0 +1,30 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Development overrides
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-loaded by `docker compose up` when present in the project root.
+# Adjusts services for local development (hot-reload, relaxed CORS, no SSL).
+#
+# Production: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  fastapi:
+    environment:
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:3001,http://localhost"
+    volumes:
+      - ./backend:/app/backend
+    command: uvicorn backend.app:app --host 0.0.0.0 --port 8000 --reload
+
+  nginx:
+    environment:
+      - CERTBOT_DOMAIN=localhost
+      - NGINX_AUTO_RELOAD_ENABLE=0
+    ports:
+      - "3000:80"
+      - "443:443"
+
+  # Skip SSL-related services in dev
+  certbot-auto:
+    profiles: ["production"]
+
+  duckdns-auto:
+    profiles: ["production"]

@@ -59,6 +59,10 @@ services:
       - kafka-data:/var/lib/kafka/data
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 3G
     healthcheck:
       test:
         [
@@ -85,6 +89,10 @@ services:
       QUARKUS_HTTP_PORT: 8080
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     depends_on:
       kafka:
         condition: service_healthy
@@ -111,6 +119,10 @@ services:
       - minio-data:/data
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 15s
@@ -157,6 +169,10 @@ services:
       - influxdb-config:/etc/influxdb2
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     healthcheck:
       test: ["CMD", "influx", "ping"]
       interval: 15s
@@ -179,6 +195,10 @@ services:
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
@@ -197,6 +217,10 @@ services:
       - keydb-data:/data
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 3G
     healthcheck:
       test: ["CMD", "keydb-cli", "ping"]
       interval: 10s
@@ -324,6 +348,10 @@ services:
       - ./spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     depends_on:
       minio:
         condition: service_healthy
@@ -354,6 +382,10 @@ services:
       - spark-events:/opt/spark-events
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 4G
     depends_on:
       - spark-master
 
@@ -408,6 +440,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
       interval: 20s
@@ -443,6 +479,10 @@ services:
       - spark-events:/opt/spark-events
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     depends_on:
       - postgres
       - spark-master
@@ -473,11 +513,15 @@ services:
       - spark-events:/opt/spark-events
     networks:
       - crypto-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     depends_on:
       - dagster-webserver
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # SERVING LAYER (FastAPI)
+  # API LAYER (FastAPI)
   # ══════════════════════════════════════════════════════════════════════════════
 
   fastapi:
@@ -509,6 +553,10 @@ services:
         condition: service_healthy
       trino:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     healthcheck:
       test:
         [
@@ -549,6 +597,10 @@ services:
     depends_on:
       fastapi:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     healthcheck:
       test:
         [
@@ -590,10 +642,6 @@ services:
     command: ["sh", "/scripts/duckdns_auto.sh"]
 
   # ══════════════════════════════════════════════════════════════════════════════
-  # PRODUCER (long-running stream)
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # ══════════════════════════════════════════════════════════════════════════════
   # INFLUXDB BACKFILL (one-shot on startup – fills gap caused by machine downtime)
   # ══════════════════════════════════════════════════════════════════════════════
 
@@ -614,6 +662,10 @@ services:
       influxdb:
         condition: service_healthy
 
+  # ══════════════════════════════════════════════════════════════════════════════
+  # PRODUCER (Binance WebSocket → Kafka)
+  # ══════════════════════════════════════════════════════════════════════════════
+
   producer:
     build:
       context: ./docker/producer
@@ -632,33 +684,3 @@ services:
       kafka:
         condition: service_healthy
 
-  # ══════════════════════════════════════════════════════════════════════════════
-  # CANDLE AGGREGATOR — DISABLED (1s→1m aggregation now handled in-flight
-  # by Flink KlineWindowAggregator, no extra container needed)
-  # ══════════════════════════════════════════════════════════════════════════════
-
-  # candle-aggregator:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/backfill/Dockerfile
-  #   container_name: candle-aggregator
-  #   restart: unless-stopped
-  #   environment:
-  #     REDIS_HOST: keydb
-  #     REDIS_PORT: 6379
-  #     INFLUX_URL: http://influxdb:8086
-  #     INFLUX_TOKEN: ${INFLUX_TOKEN}
-  #     INFLUX_ORG: ${INFLUX_ORG}
-  #     INFLUX_BUCKET: ${INFLUX_BUCKET}
-  #   volumes:
-  #     - ./src:/app/src
-  #   networks:
-  #     - crypto-net
-  #   depends_on:
-  #     keydb:
-  #       condition: service_healthy
-  #     influxdb:
-  #       condition: service_healthy
-
-# candle-aggregator service REMOVED — 1s→1m aggregation now handled
-# in-flight by Flink KlineWindowAggregator (zero extra containers).

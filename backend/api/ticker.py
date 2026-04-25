@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from serving.connections import get_redis
+from backend.core.database import get_redis
 
 router = APIRouter(prefix="/api", tags=["ticker"])
 

@@ -1,22 +1,29 @@
+"""
+Order book API — real-time bid/ask depth data.
+"""
+
+from __future__ import annotations
+
 import json
 import time
-from urllib.error import URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
 
+import httpx
 from fastapi import APIRouter, HTTPException
 
-from serving.connections import get_redis
+from backend.core.database import get_redis
 
 router = APIRouter(prefix="/api", tags=["orderbook"])
 
+_BINANCE_CLIENT = httpx.AsyncClient(timeout=3.0)
 
-def _fetch_binance_orderbook(symbol: str, limit: int = 50) -> dict | None:
-    params = urlencode({"symbol": symbol, "limit": limit})
-    url = f"https://api.binance.com/api/v3/depth?{params}"
+
+async def _fetch_binance_orderbook(symbol: str, limit: int = 50) -> dict | None:
+    """Fetch order book from Binance REST API as async fallback."""
+    url = "https://api.binance.com/api/v3/depth"
     try:
-        with urlopen(url, timeout=3) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        resp = await _BINANCE_CLIENT.get(url, params={"symbol": symbol, "limit": limit})
+        resp.raise_for_status()
+        payload = resp.json()
         bids = [[float(p), float(q)] for p, q in payload.get("bids", [])]
         asks = [[float(p), float(q)] for p, q in payload.get("asks", [])]
         best_bid = float(bids[0][0]) if bids else 0.0
@@ -29,7 +36,7 @@ def _fetch_binance_orderbook(symbol: str, limit: int = 50) -> dict | None:
             "best_ask": best_ask,
             "event_time": int(time.time() * 1000),
         }
-    except (URLError, TimeoutError, ValueError, json.JSONDecodeError):
+    except (httpx.HTTPError, ValueError, KeyError):
         return None
 
 
@@ -55,11 +62,11 @@ async def get_orderbook(symbol: str):
                     "event_time": event_time,
                 }
 
-        fallback = _fetch_binance_orderbook(symbol_u)
+        fallback = await _fetch_binance_orderbook(symbol_u)
         if not fallback:
             raise HTTPException(404, f"No order book for {symbol}")
 
-        # Warm cache for clients that poll frequently.
+        # Warm cache for clients that poll frequently
         await r.hset(
             f"orderbook:{symbol_u}",
             mapping={

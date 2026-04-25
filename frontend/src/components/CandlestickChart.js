@@ -662,7 +662,7 @@ const CandlestickChart = ({
     preloadInitialCandles,
   ]);
 
-  // Load historical data from Iceberg when date range is set
+  // Load historical data when date range is set
   useEffect(() => {
     if (!candleRef.current || !historicalRange) return;
     let cancelled = false;
@@ -901,15 +901,14 @@ const CandlestickChart = ({
       {historicalRange && (
         <div className="flex items-center justify-between px-3 py-1.5 bg-amber-900/40 border-b border-amber-700/50">
           <span className="text-xs text-amber-300">
-            Viewing historical data &mdash;{" "}
-            {new Date(historicalRange.startMs).toLocaleString()} to{" "}
-            {new Date(historicalRange.endMs).toLocaleString()} ({timeframe} candles)
+            {new Date(historicalRange.startMs).toLocaleString()} &mdash;{" "}
+            {new Date(historicalRange.endMs).toLocaleString()} ({timeframe})
           </span>
           <button
             onClick={() => setHistoricalRange(null)}
             className="text-xs text-amber-400 hover:text-white underline"
           >
-            Back to live
+            Return to Live
           </button>
         </div>
       )}
