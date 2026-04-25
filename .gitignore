@@ -32,5 +32,6 @@ spark-events/
 .DS_Store
 Thumbs.db
 
+.vscode
 .idea
 .env
