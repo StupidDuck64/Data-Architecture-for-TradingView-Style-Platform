@@ -18,9 +18,7 @@ services:
     environment:
       - CERTBOT_DOMAIN=localhost
       - NGINX_AUTO_RELOAD_ENABLE=0
-    ports:
-      - "3000:80"
-      - "443:443"
+
 
   # Skip SSL-related services in dev
   certbot-auto:

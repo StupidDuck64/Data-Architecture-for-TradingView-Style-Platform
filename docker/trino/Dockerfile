@@ -8,6 +8,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 USER root
 RUN chmod +x /usr/local/bin/entrypoint.sh && \
+    sed -i -e 's/\r$//' /usr/local/bin/entrypoint.sh && \
     chown -R trino:trino /etc/trino
 USER trino
 

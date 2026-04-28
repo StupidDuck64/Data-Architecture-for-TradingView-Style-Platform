@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 # ── Binance constants ────────────────────────────────────────────────────────
 REST_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
 REST_KLINES_URL    = "https://api.binance.com/api/v3/klines"
-WS_TICKER_URL      = "wss://stream.binance.com:9443/ws/!ticker@arr"
+WS_TICKER_URL      = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
 WS_COMBINED_BASE   = "wss://stream.binance.com:9443/stream"
 EPOCH_MS           = 1_500_000_000_000  # ~2017-07-14 Binance launch
 

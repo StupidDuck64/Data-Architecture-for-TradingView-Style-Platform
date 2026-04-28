@@ -18,7 +18,7 @@ echo " Flink is ready!"
 sleep 10
 
 # Submit Flink job in detached mode (-d)
-docker exec flink-jobmanager flink run -d -py /app/src/processing/pipeline.py
+docker exec flink-jobmanager flink run -d -py /app/src/processing/pipeline.py --pyFiles /app/src
 echo "Submitted Flink job."
 
 

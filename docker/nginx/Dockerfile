@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Install dependencies first (layer caching)
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci --production=false 2>/dev/null || npm install
+RUN npm ci --legacy-peer-deps 2>/dev/null || npm install --legacy-peer-deps --include=dev
 
 # Copy source and build
 COPY frontend/ ./
