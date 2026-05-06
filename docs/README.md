@@ -14,6 +14,11 @@ Dự án streaming giá crypto real-time từ Binance WebSocket, xử lý bằng
 - **Orchestration**: Dagster tự động chạy backfill, aggregation, maintenance
 - **Serving layer**: FastAPI (REST + WebSocket) → Nginx reverse proxy → React SPA
 
+**📊 Data Architecture:**
+- **400 USDT trading pairs** streaming real-time
+- **InfluxDB**: 1m candles, 90-day retention (cho mỗi symbol)
+- **Chart aggregation**: 5m/15m/1h/4h/1d computed on-the-fly from 1m base data
+
 ---
 
 ## Kiến trúc
@@ -22,9 +27,14 @@ Dự án streaming giá crypto real-time từ Binance WebSocket, xử lý bằng
 
 ```
 Dagster (scheduled):
+<<<<<<<< HEAD:docs/README.md
   Manual/On-demand ── src/batch/backfill.py ──→ InfluxDB + Iceberg
   03:00 AM ── src/batch/maintenance.py ──→ Compact/Expire Iceberg
   04:00 AM ── src/batch/aggregate.py   ──→ 1m→1h InfluxDB + Iceberg
+========
+  03:00 AM Chủ Nhật ── iceberg_maintenance.py ──→ Compact/Expire Iceberg
+  04:00 AM hàng ngày ── aggregate_candles.py   ──→ 1m→1h InfluxDB + Iceberg
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
 ```
 
 ## Yêu cầu
@@ -41,6 +51,7 @@ Dagster (scheduled):
 cp .env.example .env
 # Mở .env và thay đổi các giá trị mật khẩu/token
 
+<<<<<<<< HEAD:docs/README.md
 # 1. Build & start toàn bộ 21 services
 docker compose up -d --build
 
@@ -49,11 +60,25 @@ docker exec flink-jobmanager flink run -d -py /app/src/processing/pipeline.py --
 
 # 3. Submit Spark streaming job (3 query: ticker/trades/klines → Iceberg)
 docker exec -d spark-master /opt/spark/bin/spark-submit \
+========
+# 1. Build & start toàn bộ services (bao gồm FastAPI + Nginx)
+docker compose up -d --build
+
+# 2. Đợi InfluxDB khởi động (15-20 giây), sau đó set retention 90 ngày
+.\setup_influx_retention.ps1
+
+# 3. Submit Flink streaming job (6 writer: ticker/kline/indicator/depth → KeyDB + InfluxDB)
+docker exec flink-jobmanager flink run -d -py /app/src/ingest_flink_crypto.py
+
+# 4. Submit Spark streaming job (3 query: ticker/trades/klines → Iceberg)
+docker exec spark-master /opt/spark/bin/spark-submit \
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
   --master spark://spark-master:7077 \
   --packages "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.apache.spark:spark-avro_2.12:3.5.5,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.7.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262" \
   --conf spark.cores.max=2 \
   /app/src/lakehouse/pipeline.py
 
+<<<<<<<< HEAD:docs/README.md
 # 4. Nạp dữ liệu lịch sử lần đầu (90 ngày)
 docker compose run --rm influx-backfill python /app/src/batch/backfill.py --mode populate --days 90
 
@@ -63,9 +88,49 @@ docker exec spark-master /opt/spark/bin/spark-submit \
   --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2" \
   --conf spark.driver.memory=2g --conf spark.executor.memory=2g \
   /app/src/batch/backfill.py --mode all --iceberg-mode incremental
+========
+# 5. (TUỲ CHỌN) Populate 90 ngày historical data cho TẤT CẢ 400 symbols (⏱️ 2-3 giờ)
+docker compose up initial-populate
+
+# HOẶC chỉ populate 1 vài mã cụ thể (nhanh hơn):
+docker exec initial-populate python /app/backfill_historical.py --mode populate --days 90 --symbols BTCUSDT ETHUSDT
 ```
 
-> Bước 2-3 submit streaming job thủ công (chạy liên tục, không qua Dagster). Bước 4 chạy 1 lần để nạp dữ liệu lịch sử, sau đó Dagster tự chạy lại lúc 2:00 AM hằng ngày.
+> **Lưu ý quan trọng:**
+> - Bước 2 đặt InfluxDB bucket retention = **90 ngày** (3 tháng) cho 1m candles
+> - Bước 5 populate **TẤT CẢ 400 symbols** (fetched từ Binance). Mất 2-3 giờ (~52M candles).
+> - Nếu chỉ muốn test nhanh, dùng `--symbols BTCUSDT ETHUSDT BNBUSDT` thay vì chạy hết 400.
+> - Chart 5m/15m/1h được **tính on-the-fly** từ 1m, không lưu riêng
+> - Bước 2-4 chạy streaming job liên tục, bước 5 chạy 1 lần backfill
+
+## Lệnh backfill thủ công (chỉ chạy khi cần)
+
+```bash
+# Fill gaps InfluxDB (khi máy tắt một thời gian)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2" \
+  /app/src/backfill_historical.py --mode influx
+
+# Backfill Iceberg incremental (kéo klines mới nhất vào Iceberg)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2" \
+  /app/src/backfill_historical.py --mode iceberg --iceberg-mode incremental
+
+# Backfill Iceberg from 2017 (lần đầu populate toàn bộ historical data)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2" \
+  /app/src/backfill_historical.py --mode iceberg --iceberg-mode backfill
+
+# Chạy cả 2 mode (influx + iceberg incremental)
+docker exec spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.2" \
+  /app/src/backfill_historical.py --mode all --iceberg-mode incremental
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
+```
 
 ## Tài khoản truy cập
 
@@ -180,15 +245,20 @@ Submit thủ công 1 lần, chạy liên tục. Đọc 3 Kafka topics, ghi vào 
 
 Schema: `iceberg.crypto_lakehouse.*` — query bằng Trino tại http://localhost:8083.
 
+<<<<<<<< HEAD:docs/README.md
 ### `src/batch/backfill.py` — Unified Backfill
+========
+### `src/backfill_historical.py` — Unified Backfill & Populate
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
 
-Gộp chức năng cũ của `backfill_influx.py` + `ingest_historical_iceberg.py`. Hỗ trợ 3 mode:
+Gộp chức năng của `backfill_influx.py` + `ingest_historical_iceberg.py` + `initial_populate_influx.py`. Hỗ trợ 4 mode:
 
-| Mode             | Chức năng                                                                                                     |
-| :--------------- | :------------------------------------------------------------------------------------------------------------ |
-| `--mode influx`  | Phát hiện khoảng trống dữ liệu InfluxDB (do tắt máy), fill bằng Binance REST API                              |
-| `--mode iceberg` | Kéo klines lịch sử từ Binance → Iceberg. `--iceberg-mode backfill` kéo từ 2017, `incremental` kéo từ nến cuối |
-| `--mode all`     | Chạy cả hai (mặc định khi Dagster gọi lúc 02:00 AM)                                                           |
+| Mode              | Chức năng                                                                                                     |
+| :---------------- | :------------------------------------------------------------------------------------------------------------ |
+| `--mode influx`   | Phát hiện khoảng trống dữ liệu InfluxDB (do tắt máy), fill bằng Binance REST API                              |
+| `--mode iceberg`  | Kéo klines lịch sử từ Binance → Iceberg. `--iceberg-mode backfill` kéo từ 2017, `incremental` kéo từ nến cuối |
+| `--mode populate` | Force pull N ngày 1m candles cho tất cả 400 symbols (lần đầu khởi động). `--days 90` mặc định.                 |
+| `--mode all`      | Chạy influx + iceberg (mặc định khi Dagster gọi lúc 02:00 AM, không bao gồm populate)                         |
 
 ### `src/batch/aggregate.py` — Candle Aggregation
 
@@ -217,8 +287,13 @@ Dagster tự chạy Chủ Nhật lúc 03:00 AM.
 | Asset                       | Schedule           | Chức năng                                       |
 | :-------------------------- | :----------------- | :---------------------------------------------- |
 | `backfill_historical`       | **Chạy thủ công**  | Backfill InfluxDB gaps + Iceberg klines         |
+<<<<<<<< HEAD:docs/README.md
 | `aggregate_candles`         | 04:00 AM hàng ngày | Gọi `src/batch/aggregate.py --mode all`           |
 | `iceberg_table_maintenance` | 03:00 AM Chủ Nhật  | Gọi `src/batch/maintenance.py`                    |
+========
+| `aggregate_candles`         | 04:00 AM hàng ngày | Gọi `aggregate_candles.py --mode all`           |
+| `iceberg_table_maintenance` | 03:00 AM Chủ Nhật  | Gọi `iceberg_maintenance.py`                    |
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
 
 > **Lưu ý:** `backfill_historical` **không có schedule tự động**. Chỉ chạy thủ công khi cần (xem phần "Lệnh backfill thủ công" ở trên).
 
@@ -261,14 +336,27 @@ Multi-stage Dockerfile: build React app (Node 20) → copy vào nginx:1.25-alpin
 
 ### Legacy files
 
+<<<<<<<< HEAD:docs/README.md
 Các file legacy đã được loại bỏ khỏi `src/` trong hiện trạng repository.
+========
+| File                           | Lý do                                                            |
+| :----------------------------- | :--------------------------------------------------------------- |
+| `backfill_influx.py`           | Chức năng đã merge vào `backfill_historical.py --mode influx`    |
+| `ingest_historical_iceberg.py` | Chức năng đã merge vào `backfill_historical.py --mode iceberg`   |
+| `initial_populate_influx.py`   | Chức năng đã merge vào `backfill_historical.py --mode populate` |
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
 
 ## Dữ liệu lưu ở đâu?
 
 | Database            | Vai trò         | Dữ liệu                   | Key/Measurement                                                           |
 | :------------------ | :-------------- | :------------------------ | :------------------------------------------------------------------------ |
+<<<<<<<< HEAD:docs/README.md
 | **KeyDB**           | Cache real-time | 400 symbols               | `ticker:latest:*`, `candle:1s:*`, `candle:1m:*`, `candle:latest:*`, `indicator:latest:*`, `orderbook:*` |
 | **InfluxDB**        | Time-series     | 1m candles (retention 90d), indicators, market ticks | `market_ticks`, `candles`, `indicators`                                   |
+========
+| **KeyDB**           | Cache real-time | 400 symbols               | `ticker:latest:*`, `candle:latest:*`, `indicator:latest:*`, `orderbook:*` |
+| **InfluxDB**        | Time-series     | Biểu đồ, 90 ngày retention | `market_ticks`, `candles` (1m only, 5m/15m/1h tính on-the-fly)             |
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):README.md
 | **Iceberg** (MinIO) | Data lake       | Lưu trữ dài hạn           | `coin_ticker`, `coin_trades`, `coin_klines`, `coin_klines_hourly`         |
 | **Trino**           | SQL query       | Query Iceberg             | `iceberg.crypto_lakehouse.*`                                              |
 | **Postgres**        | Metadata        | Dagster + Iceberg catalog | Nội bộ                                                                    |

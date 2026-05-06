@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "Depth",
+  "namespace": "com.cryptoprice",
+  "fields": [
+    {"name": "event_time",     "type": "long"},
+    {"name": "symbol",         "type": "string"},
+    {"name": "last_update_id", "type": "long"},
+    {"name": "bids",           "type": "string"},
+    {"name": "asks",           "type": "string"}
+  ]
+}

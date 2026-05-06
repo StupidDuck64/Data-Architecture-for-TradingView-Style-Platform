@@ -65,6 +65,7 @@ def to_candle_rows(rows: list[tuple]) -> list[dict]:
 
 
 def merge_unique(existing: list[dict], incoming: list[dict]) -> list[dict]:
+<<<<<<< HEAD
     """Merge candle rows by openTime, preferring the latest version per timestamp."""
     if not incoming:
         return existing
@@ -74,6 +75,69 @@ def merge_unique(existing: list[dict], incoming: list[dict]) -> list[dict]:
     return sorted(merged.values(), key=lambda x: x["openTime"])
 
 
+=======
+    """Merge candle rows by openTime, preferring higher-quality candles.
+
+    Quality priority:
+    1. Closed/final candle (if 'is_closed' or 'x' field exists)
+    2. Higher volume (more complete data)
+    3. Later in merge order (incoming preferred if equal quality)
+    """
+    if not incoming:
+        return existing
+
+    merged: dict[int, dict] = {}
+
+    # First pass: add all existing candles
+    for c in existing:
+        merged[int(c["openTime"])] = c
+
+    # Second pass: merge incoming, choosing better candle on conflict
+    for c in incoming:
+        t = int(c["openTime"])
+        if t not in merged:
+            merged[t] = c
+        else:
+            existing_candle = merged[t]
+            # Choose better candle based on quality
+            if _is_better_candle(c, existing_candle):
+                merged[t] = c
+
+    return sorted(merged.values(), key=lambda x: x["openTime"])
+
+
+def _is_better_candle(new: dict, old: dict) -> bool:
+    """Return True if new candle is better quality than old candle.
+
+    Priority:
+    1. Closed/final candle wins over partial
+    2. Higher volume wins (more complete data)
+    3. If equal, prefer new (incoming)
+    """
+    # Check if either candle has closed/final flag
+    new_closed = new.get("is_closed") or new.get("x")
+    old_closed = old.get("is_closed") or old.get("x")
+
+    # Priority 1: Closed candle wins
+    if new_closed and not old_closed:
+        return True
+    if old_closed and not new_closed:
+        return False
+
+    # Priority 2: Higher volume wins
+    new_vol = float(new.get("volume", 0))
+    old_vol = float(old.get("volume", 0))
+
+    if new_vol > old_vol:
+        return True
+    if old_vol > new_vol:
+        return False
+
+    # Priority 3: If equal quality, prefer new (incoming)
+    return True
+
+
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 def aggregate(candles: list[dict], target_ms: int) -> list[dict]:
     """Re-sample OHLCV candles into larger-interval buckets."""
     if not candles:

@@ -1,0 +1,38 @@
+# ─── JobManager ───────────────────────────────────────────────────────────────
+jobmanager.rpc.address: flink-jobmanager
+jobmanager.rpc.port: 6123
+jobmanager.bind-host: 0.0.0.0
+jobmanager.memory.process.size: 2304m
+jobmanager.execution.failover-strategy: region
+
+# ─── TaskManager ──────────────────────────────────────────────────────────────
+taskmanager.bind-host: 0.0.0.0
+taskmanager.host: flink-taskmanager
+taskmanager.memory.process.size: 6144m
+taskmanager.numberOfTaskSlots: 12
+taskmanager.memory.framework.off-heap.size: 768m
+taskmanager.memory.task.off-heap.size: 1536m
+taskmanager.memory.managed.size: 1024m
+taskmanager.memory.network.min: 768m
+taskmanager.memory.network.max: 1280m
+
+# ─── Parallelism ──────────────────────────────────────────────────────────────
+parallelism.default: 1
+
+# ─── REST ─────────────────────────────────────────────────────────────────────
+rest.address: 0.0.0.0
+rest.bind-address: 0.0.0.0
+rest.port: 8081
+
+# ─── Checkpointing ────────────────────────────────────────────────────────────
+state.backend: hashmap
+state.checkpoints.dir: file:///tmp/flink-checkpoints
+
+# ─── S3 / MinIO ───────────────────────────────────────────────────────────────
+s3.endpoint: http://minio:9000
+s3.access-key: minioadmin
+s3.secret-key: minioadmin
+s3.path.style.access: true
+
+# ─── Java opts (required for Flink 1.18 on Java 11) ──────────────────────────
+env.java.opts.all: --add-exports=java.base/sun.net.util=ALL-UNNAMED --add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED --add-exports=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED

@@ -18,7 +18,43 @@ echo " Flink is ready!"
 sleep 10
 
 # Submit Flink job in detached mode (-d)
+<<<<<<< HEAD
 docker exec flink-jobmanager flink run -d -py /app/src/processing/pipeline.py --pyFiles /app/src
+=======
+# Create a proper Python package structure
+docker exec flink-jobmanager bash -c "cd /app/src && python3 -c \"
+import zipfile
+import os
+
+with zipfile.ZipFile('/tmp/deps.zip', 'w') as zf:
+    # Add common module with proper structure
+    for root, dirs, files in os.walk('common'):
+        for file in files:
+            if file.endswith('.py'):
+                filepath = os.path.join(root, file)
+                zf.write(filepath, filepath)
+
+    # Add processing/writers module with proper structure
+    # Include __init__.py to make it a proper package
+    writers_init = 'processing/writers/__init__.py'
+    if os.path.exists(writers_init):
+        zf.write(writers_init, 'writers/__init__.py')
+    else:
+        # Create empty __init__.py if it doesn't exist
+        zf.writestr('writers/__init__.py', '')
+
+    for root, dirs, files in os.walk('processing/writers'):
+        for file in files:
+            if file.endswith('.py') and file != '__init__.py':
+                filepath = os.path.join(root, file)
+                # Write as writers/filename.py (flatten structure)
+                zf.write(filepath, 'writers/' + file)
+\"
+"
+
+# Submit with the zip file
+docker exec flink-jobmanager bash -c "cd /app/src/processing && flink run -d -py pipeline.py --pyFiles /tmp/deps.zip"
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 echo "Submitted Flink job."
 
 

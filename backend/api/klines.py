@@ -14,6 +14,10 @@ from fastapi import APIRouter, HTTPException, Query
 
 from backend.core.constants import INTERVAL_SECONDS, INFLUX_1M_RETENTION_DAYS, MAX_RAW_CANDLES, LIVE_MAX_BASE_ROWS, MAX_BACKFILL_PAGES
 from backend.core.database import get_redis
+<<<<<<< HEAD
+=======
+from backend.core.redis_sentinel import get_redis_master
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 from backend.services.candle_service import (
     validate_symbol,
     validate_interval,
@@ -78,7 +82,13 @@ async def get_klines(
     # Cache result (skip for scroll queries)
     if not endTime:
         ttl_ms = 200 if interval == "1s" else 1500
+<<<<<<< HEAD
         pipe = r.pipeline()
+=======
+        # Use master for write operations
+        r_master = await get_redis_master()
+        pipe = r_master.pipeline()
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
         pipe.set(cache_key, json.dumps(result))
         pipe.pexpire(cache_key, ttl_ms)
         await pipe.execute()
@@ -152,7 +162,14 @@ async def _fetch_1m_plus_candles(
 
 
 async def _enrich_with_live_ticker(r, symbol: str, target_sec: int, candles: list[dict]) -> list[dict]:
+<<<<<<< HEAD
     """Enrich the latest candle with live ticker price for 5m+ intervals."""
+=======
+    """Enrich the latest candle with live ticker price for 5m+ intervals.
+
+    Only enriches if ticker is fresher than the latest sub-candle data.
+    """
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
     ticker = await r.hgetall(f"ticker:latest:{symbol}")
     if not (ticker.get("price") and ticker.get("event_time")):
         return candles
@@ -164,6 +181,7 @@ async def _enrich_with_live_ticker(r, symbol: str, target_sec: int, candles: lis
     latest_candle_ts = candles[-1]["openTime"] if candles else 0
     window_is_open = int(time.time() * 1000) < (aligned_time + target_ms)
 
+<<<<<<< HEAD
     if (
         candles and candles[-1]["openTime"] == aligned_time
         and live_ts > latest_candle_ts and window_is_open
@@ -172,6 +190,29 @@ async def _enrich_with_live_ticker(r, symbol: str, target_sec: int, candles: lis
         candles[-1]["high"] = max(candles[-1]["high"], live_price)
         candles[-1]["low"] = min(candles[-1]["low"], live_price)
     elif not candles or aligned_time > candles[-1]["openTime"]:
+=======
+    # Check ticker freshness against sub-candle data
+    # For aggregated intervals (5m+), verify ticker is newer than source data
+    if candles and candles[-1]["openTime"] == aligned_time and window_is_open:
+        # Query the latest sub-candle timestamp for this window
+        source_interval = "1m"  # 5m+ intervals aggregate from 1m
+        source_key = f"candle:{source_interval}:{symbol}"
+        latest_sub = await r.zrevrange(source_key, 0, 0, withscores=True)
+
+        latest_sub_ts = 0
+        if latest_sub:
+            latest_sub_ts = int(latest_sub[0][1])  # score = kline_start timestamp
+
+        # Only enrich if ticker is fresher than latest sub-candle
+        if live_ts > max(latest_candle_ts, latest_sub_ts):
+            candles[-1]["close"] = live_price
+            candles[-1]["high"] = max(candles[-1]["high"], live_price)
+            candles[-1]["low"] = min(candles[-1]["low"], live_price)
+        return candles
+
+    # Create new candle if ticker is for a newer window
+    if not candles or aligned_time > candles[-1]["openTime"]:
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
         candles.append({
             "openTime": aligned_time,
             "open": live_price,

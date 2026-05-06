@@ -4,9 +4,15 @@ import logging
 
 log = logging.getLogger("backend.core.config")
 
+<<<<<<< HEAD
 # ─── KeyDB (Redis-compatible) ───────────────────────────────────────────────
 REDIS_HOST = os.environ.get("REDIS_HOST", "keydb")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+=======
+# ─── Redis Sentinel (High Availability) ─────────────────────────────────────
+# Redis Sentinel configuration is handled in redis_sentinel.py
+# using REDIS_SENTINELS and REDIS_MASTER_NAME environment variables
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 
 # ─── InfluxDB ───────────────────────────────────────────────────────────────
 INFLUX_URL = os.environ.get("INFLUX_URL", "http://influxdb:8086")

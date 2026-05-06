@@ -560,12 +560,101 @@ def run_iceberg_historical(iceberg_mode: str = "incremental", symbols_list: list
     spark.stop()
 
 
+def populate_symbol_influx(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    write_api
+) -> int:
+    """Populate 1 symbol từ start_ms → end_ms vào InfluxDB."""
+    days = (end_ms - start_ms) / 86_400_000
+    log.info(
+        "[%s] Populating %.1f days: %s → %s",
+        symbol, days,
+        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        datetime.fromtimestamp(end_ms   / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    )
+
+    klines = fetch_klines(symbol, start_ms, end_ms, interval="1m", batch_limit=KLINE_BATCH_INFLUX)
+    if not klines:
+        log.warning("[%s] No klines returned.", symbol)
+        return 0
+
+    points = klines_to_influx_points(symbol, klines)
+    if not points:
+        return 0
+
+    try:
+        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
+        log.info("[%s] Written %d points.", symbol, len(points))
+        return len(points)
+    except Exception as e:
+        log.error("[%s] write error: %s", symbol, e)
+        return 0
+
+
+def run_initial_populate(days: int = 90, symbols_list: list[str] | None = None):
+    """
+    Entry point cho initial populate: force pull N ngày 1m candles cho TẤT CẢ 400 symbols vào InfluxDB.
+    Chạy 1 lần lúc khởi động ban đầu.
+    """
+    from influxdb_client import InfluxDBClient
+    from influxdb_client.client.write_api import SYNCHRONOUS
+
+    log.info("=== Initial Populate InfluxDB (%d days) ===", days)
+
+    client    = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    write_api = client.write_api(write_options=SYNCHRONOUS)
+
+    wait_for_influx(client)
+
+    symbols = symbols_list or fetch_usdt_symbols()
+    log.info("Symbols: %d", len(symbols))
+
+    now_ms    = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end_ms    = now_ms - (now_ms % 60_000)  # làm tròn xuống phút
+    start_ms  = end_ms - (days * 86_400_000)
+
+    total_candles = len(symbols) * days * 1440  # 1440 candles/day
+    log.info(
+        "Period: %s → %s (~%.1fM candles)",
+        datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+        datetime.fromtimestamp(end_ms   / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+        total_candles / 1_000_000,
+    )
+
+    total_points = 0
+    total_syms   = len(symbols)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(populate_symbol_influx, sym, start_ms, end_ms, write_api): sym
+            for sym in symbols
+        }
+        for idx, future in enumerate(as_completed(futures), 1):
+            sym = futures[future]
+            try:
+                n = future.result()
+                total_points += n
+                if idx % 10 == 0 or idx == total_syms:
+                    log.info("Progress: %d/%d symbols completed.", idx, total_syms)
+            except Exception as e:
+                log.error("[%s] Unexpected error: %s", sym, e)
+
+    log.info(
+        "Initial populate complete — %d/%d symbols, %d total points written.",
+        total_syms, total_syms, total_points,
+    )
+    client.close()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(
+<<<<<<< HEAD:src/batch/backfill.py
         description="Unified backfill + populate + historical import.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
@@ -573,6 +662,30 @@ def main():
     parser.add_argument("--iceberg-mode", choices=["backfill", "incremental"], default="incremental")
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--days", type=int, default=90)
+=======
+        description="Unified backfill (InfluxDB gap fill) + initial populate + historical import (Iceberg).",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--mode", choices=["influx", "iceberg", "populate", "all"], default="all",
+        help="influx   = fill InfluxDB gaps\n"
+             "iceberg  = historical klines → Iceberg\n"
+             "populate = force pull N days for all symbols (lần đầu khởi động)\n"
+             "all      = influx + iceberg (mặc định, không bao gồm populate)",
+    )
+    parser.add_argument(
+        "--iceberg-mode", choices=["backfill", "incremental"], default="incremental",
+        help="backfill    = kéo từ 2017 → nay (chạy 1 lần đầu)\nincremental = từ nến cuối → nay (default)",
+    )
+    parser.add_argument(
+        "--days", type=int, default=90,
+        help="Số ngày lịch sử để populate (chỉ dùng với --mode populate). Mặc định: 90.",
+    )
+    parser.add_argument(
+        "--symbols", nargs="*", default=None,
+        help="Danh sách symbols cụ thể (VD: BTCUSDT ETHUSDT). Mặc định: tất cả USDT pairs.",
+    )
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):src/backfill_historical.py
     args = parser.parse_args()
 
     log.info("=== Backfill & Historical Import | mode=%s ===", args.mode)

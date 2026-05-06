@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "AggTrade",
+  "namespace": "com.cryptoprice",
+  "fields": [
+    {"name": "event_time",     "type": "long"},
+    {"name": "symbol",         "type": "string"},
+    {"name": "agg_trade_id",   "type": "long"},
+    {"name": "price",          "type": "double"},
+    {"name": "quantity",       "type": "double"},
+    {"name": "trade_time",     "type": "long"},
+    {"name": "is_buyer_maker", "type": "boolean"}
+  ]
+}

@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production overrides
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Overrides development defaults for production deployment:
+#  - Multi-worker FastAPI (no reload)
+#  - Strict CORS
+#  - Memory limits for resource governance
+#  - Standard ports (80/443)
+
+services:
+  fastapi:
+    command: uvicorn backend.app:app --host 0.0.0.0 --port 8000 --workers 4
+    environment:
+      CORS_ORIGINS: "https://${CERTBOT_DOMAIN:-localhost}"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nginx:
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CERTBOT_DOMAIN=${CERTBOT_DOMAIN}
+      - NGINX_AUTO_RELOAD_ENABLE=1
+      - NGINX_RELOAD_INTERVAL_SECONDS=${NGINX_RELOAD_INTERVAL_SECONDS:-21600}

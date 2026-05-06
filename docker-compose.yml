@@ -663,8 +663,30 @@ services:
         condition: service_healthy
 
   # ══════════════════════════════════════════════════════════════════════════════
+<<<<<<< HEAD
   # PRODUCER (Binance WebSocket → Kafka)
   # ══════════════════════════════════════════════════════════════════════════════
+=======
+  # INITIAL POPULATE (Chạy 1 lần để đổ 90 ngày data cho tất cả 400 symbols)
+  # ══════════════════════════════════════════════════════════════════════════════
+  initial-populate:
+    build:
+      context: .
+      dockerfile: docker/backfill/Dockerfile
+    container_name: initial-populate
+    restart: "no"
+    command: ["python", "/app/backfill_historical.py", "--mode", "populate", "--days", "90"]
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: ${INFLUX_ORG}
+      INFLUX_BUCKET: ${INFLUX_BUCKET}
+    networks:
+      - crypto-net
+    depends_on:
+      influxdb:
+        condition: service_healthy
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 
   producer:
     build:

@@ -11,6 +11,10 @@ import httpx
 from fastapi import APIRouter, HTTPException
 
 from backend.core.database import get_redis
+<<<<<<< HEAD
+=======
+from backend.core.redis_sentinel import get_redis_master
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
 
 router = APIRouter(prefix="/api", tags=["orderbook"])
 
@@ -66,8 +70,14 @@ async def get_orderbook(symbol: str):
         if not fallback:
             raise HTTPException(404, f"No order book for {symbol}")
 
+<<<<<<< HEAD
         # Warm cache for clients that poll frequently
         await r.hset(
+=======
+        # Warm cache for clients that poll frequently - use master for writes
+        r_master = await get_redis_master()
+        await r_master.hset(
+>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA)
             f"orderbook:{symbol_u}",
             mapping={
                 "bids": json.dumps(fallback["bids"]),

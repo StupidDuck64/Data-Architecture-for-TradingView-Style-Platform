@@ -126,6 +126,7 @@ function generateMockCandles(
 /**
  * Fetch historical OHLCV candles.
  *
+<<<<<<<< HEAD:frontend/src/services/marketDataService.ts
  * @param symbol      e.g. 'BTCUSDT'
  * @param timeframe   key of TIMEFRAMES, e.g. '1h'
  * @param limit       number of candles
@@ -137,6 +138,14 @@ export async function fetchCandles(
   limit: number = 200,
   endTime: number | null = null,
 ): Promise<Candle[]> {
+========
+ * @param {string} symbol      e.g. 'BTCUSDT'
+ * @param {string} timeframe   key of TIMEFRAMES, e.g. '1h'
+ * @param {number} [limit=1500] number of candles — increased for more historical data
+ * @returns {Promise<Array>}   array of { time, open, high, low, close, volume }
+ */
+export async function fetchCandles(symbol, timeframe = "1h", limit = 1500) {
+>>>>>>>> 95fa5d0 (replace KeyDB by Redis sentinal HA & Kafka HA):frontend/src/services/marketDataService.js
   if (DATA_SOURCE === "api") {
     let url = `${API_BASE_URL}/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(timeframe)}&limit=${limit}`;
     if (endTime) {
