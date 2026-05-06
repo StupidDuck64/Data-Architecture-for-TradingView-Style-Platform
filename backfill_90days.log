@@ -1,7 +1,0 @@
- Container influxdb Running 
- Container influxdb Waiting 
- Container influxdb Healthy 
- Container cryptoprice-influx-backfill-run-4e881d071706 Creating 
- Container cryptoprice-influx-backfill-run-4e881d071706 Created 
-python: can't open file '/app/C:/Program Files/Git/app/src/batch/backfill.py': [Errno 2] No such file or directory
-
